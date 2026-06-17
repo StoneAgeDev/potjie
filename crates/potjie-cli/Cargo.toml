@@ -1,0 +1,16 @@
+[package]
+name = "potjie-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "potjie"
+path = "src/main.rs"
+
+[dependencies]
+potjie-core = { path = "../potjie-core" }
+anyhow.workspace = true
+clap = { version = "4", features = ["derive"] }
+rpassword = "7"

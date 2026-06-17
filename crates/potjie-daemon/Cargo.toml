@@ -1,0 +1,16 @@
+[package]
+name = "potjie-daemon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "potjied"
+path = "src/main.rs"
+
+[dependencies]
+potjie-core = { path = "../potjie-core" }
+anyhow.workspace = true
+serde_json.workspace = true
+libc = "0.2"

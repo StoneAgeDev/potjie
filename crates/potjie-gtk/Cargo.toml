@@ -1,0 +1,19 @@
+[package]
+name = "potjie-gtk"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "potjie-gtk"
+path = "src/main.rs"
+
+[dependencies]
+potjie-core = { path = "../potjie-core" }
+anyhow.workspace = true
+gtk = { package = "gtk4", version = "0.9" }
+adw = { package = "libadwaita", version = "0.7" }
+vte = { package = "vte4", version = "0.8" }
+async-channel = "2"
+libc = "0.2"
