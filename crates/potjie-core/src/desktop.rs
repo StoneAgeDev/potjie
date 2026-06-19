@@ -252,10 +252,84 @@ fn sanitize(s: &str) -> String {
         .collect()
 }
 
+/// A launcher `.desktop` Potjie generated for a box.
+#[derive(Debug, Clone)]
+pub struct Wrapper {
+    pub path: PathBuf,
+    pub name: String,
+    pub box_name: String,
+    pub kind: Kind,
+    pub app_id: String,
+}
+
+/// List the launchers Potjie generated, optionally filtered to one box. Ours are
+/// identified by the `X-Potjie-Box` key we stamp into every generated file (so we
+/// never touch unrelated `.desktop` files).
+pub fn list_wrappers(box_name: Option<&str>) -> Result<Vec<Wrapper>> {
+    let dir = applications_dir()?;
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Ok(out); // no apps dir yet → no wrappers
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("desktop") {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(&path) else { continue };
+        let (mut bx, mut kind, mut app, mut name) = (None, None, None, None);
+        for line in text.lines() {
+            if let Some(v) = line.strip_prefix("X-Potjie-Box=") {
+                bx = Some(v.trim().to_string());
+            } else if let Some(v) = line.strip_prefix("X-Potjie-Kind=") {
+                kind = Kind::parse(v.trim());
+            } else if let Some(v) = line.strip_prefix("X-Potjie-App=") {
+                app = Some(v.trim().to_string());
+            } else if name.is_none() {
+                if let Some(v) = line.strip_prefix("Name=") {
+                    name = Some(v.trim().to_string());
+                }
+            }
+        }
+        // Skip anything missing our markers (i.e. not a Potjie launcher).
+        let (Some(bx), Some(kind), Some(app)) = (bx, kind, app) else { continue };
+        if box_name.is_some_and(|filter| filter != bx) {
+            continue;
+        }
+        out.push(Wrapper {
+            name: name.unwrap_or_else(|| app.clone()),
+            path,
+            box_name: bx,
+            kind,
+            app_id: app,
+        });
+    }
+    out.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    Ok(out)
+}
+
+/// Delete one generated launcher.
+pub fn remove_wrapper(path: &Path) -> Result<()> {
+    std::fs::remove_file(path).with_context(|| format!("removing launcher {}", path.display()))
+}
+
+/// Delete every launcher generated for `box_name` (they go stale when the box is
+/// deleted). Returns how many were removed.
+pub fn remove_wrappers_for_box(box_name: &str) -> Result<usize> {
+    let mut n = 0;
+    for w in list_wrappers(Some(box_name))? {
+        if remove_wrapper(&w.path).is_ok() {
+            n += 1;
+        }
+    }
+    Ok(n)
+}
+
 // ---- SSH alias for host apps --------------------------------------------
 
-/// Potjie's managed ssh config fragment (`~/.potjie/ssh/config`).
-fn ssh_config_path() -> Result<PathBuf> {
+/// Potjie's managed ssh config fragment (`~/.potjie/ssh/config`). Public so the
+/// forward manager can point `ssh -F` at the same file the aliases live in.
+pub fn ssh_config_path() -> Result<PathBuf> {
     Ok(paths::root()?.join("ssh").join("config"))
 }
 
@@ -273,6 +347,12 @@ pub fn sync_ssh_config() -> Result<()> {
     for vm in Vm::list().unwrap_or_default() {
         let Ok(st) = vm.status() else { continue };
         let (true, Some(port)) = (st.running, st.ssh_port) else { continue };
+        // ControlMaster + a per-box ControlPath enable SSH connection multiplexing,
+        // so the daemon can hold one background master and add/remove port forwards
+        // live (`ssh -O forward`/`-O cancel`) without restarting the box.
+        let control = crate::forward::control_path(&vm.cfg.name)
+            .map(|p| p.display().to_string())
+            .unwrap_or_default();
         body.push_str(&format!(
             "\nHost potjie-{name}\n\
 \tHostName 127.0.0.1\n\
@@ -282,11 +362,21 @@ pub fn sync_ssh_config() -> Result<()> {
 \tIdentitiesOnly yes\n\
 \tStrictHostKeyChecking no\n\
 \tUserKnownHostsFile /dev/null\n\
-\tLogLevel ERROR\n",
+\tLogLevel ERROR\n\
+\tSetEnv TERM=xterm-256color\n\
+\tControlMaster auto\n\
+\tControlPath {control}\n\
+\tControlPersist 30s\n\
+\tExitOnForwardFailure no\n",
             name = vm.cfg.name,
             user = vm.cfg.username,
             key = vm.paths.ssh_key.display(),
         ));
+        // Persisted port forwards: any fresh connection (and the daemon's master)
+        // picks these up; live edits are reconciled in `forward::reload`.
+        for f in &vm.cfg.forwards {
+            body.push_str(&f.config_line());
+        }
     }
     write_private(&frag, body.as_bytes())?;
     ensure_ssh_include(&frag)?;

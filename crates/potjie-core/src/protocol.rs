@@ -5,6 +5,7 @@
 //! that has `Acquire`d it. Closing the connection (cleanly or by crashing)
 //! releases the lease, and the daemon re-locks the box when the count hits zero.
 
+use crate::config::Forward;
 use serde::{Deserialize, Serialize};
 
 /// Path of the daemon's control socket under the runtime dir.
@@ -25,6 +26,11 @@ pub enum Request {
     Status { box_name: String },
     /// Status of all boxes.
     List,
+    /// Replace a box's port-forward set: persists to `box.json` and applies the
+    /// change live if the box is running. Does not require a lease.
+    SetForwards { box_name: String, forwards: Vec<Forward> },
+    /// Read a box's persisted port-forward set.
+    GetForwards { box_name: String },
     /// Liveness check.
     Ping,
 }
@@ -37,6 +43,8 @@ pub enum Response {
     Stopped,
     Status(BoxStatus),
     List { boxes: Vec<BoxStatus> },
+    ForwardsSet,
+    Forwards { forwards: Vec<Forward> },
     Pong,
     Error { message: String },
 }

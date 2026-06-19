@@ -19,21 +19,24 @@ pub fn qemu_system() -> String {
     resolve("POTJIE_QEMU_SYSTEM", "qemu-system-x86_64")
 }
 
-/// Path to the guard daemon binary. Defaults to a `potjied` sitting next to the
-/// current executable, falling back to `PATH`.
-pub fn potjied() -> String {
-    if let Ok(p) = std::env::var("POTJIE_DAEMON") {
+/// Path to the multicall `potjie` binary (CLI + `potjie daemon`). Defaults to a
+/// `potjie` sitting next to the current executable — so the GTK app finds the
+/// sibling `potjie`, and the CLI finds itself — falling back to `PATH`. A bundled
+/// distribution overrides it with `POTJIE_BIN` (e.g. the copy materialized into
+/// `~/.potjie/bin`).
+pub fn potjie_bin() -> String {
+    if let Ok(p) = std::env::var("POTJIE_BIN") {
         return p;
     }
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
-            let cand = dir.join("potjied");
+            let cand = dir.join("potjie");
             if cand.exists() {
                 return cand.to_string_lossy().into_owned();
             }
         }
     }
-    "potjied".to_string()
+    "potjie".to_string()
 }
 
 /// Run a command, returning an error that includes stderr on failure.

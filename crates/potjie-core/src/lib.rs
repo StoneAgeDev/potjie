@@ -25,6 +25,7 @@ pub mod boxes;
 pub mod config;
 pub mod desktop;
 pub mod disk;
+pub mod forward;
 pub mod guard;
 pub mod paths;
 pub mod proc;

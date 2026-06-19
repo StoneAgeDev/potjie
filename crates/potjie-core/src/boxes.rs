@@ -142,6 +142,14 @@ impl Vm {
         qemu::status(&self.paths)
     }
 
+    /// Persist the in-memory [`BoxConfig`] back to `box.json` (e.g. after editing
+    /// port forwards).
+    pub fn save_config(&self) -> Result<()> {
+        std::fs::write(&self.paths.config, serde_json::to_vec_pretty(&self.cfg)?)
+            .with_context(|| format!("writing {}", self.paths.config.display()))?;
+        Ok(())
+    }
+
     /// Boot the box, returning the forwarded SSH port.
     pub fn start(&self, passphrase: &str) -> Result<u16> {
         qemu::start(&self.paths, &self.cfg, passphrase)
@@ -159,21 +167,33 @@ impl Vm {
             .status()?
             .ssh_port
             .context("box is not running")?;
+        let addr = ("127.0.0.1", port)
+            .to_socket_addrs_first()
+            .context("resolving forward address")?;
         let deadline = Instant::now() + timeout;
         while Instant::now() < deadline {
-            if TcpStream::connect_timeout(
-                &("127.0.0.1", port)
-                    .to_socket_addrs_first()
-                    .context("resolving forward address")?,
-                Duration::from_secs(2),
-            )
-            .is_ok()
-            {
+            // A bare TCP connect isn't enough: with slirp the forwarded port
+            // accepts before the guest's sshd is actually up. Require the SSH
+            // identification banner ("SSH-…"), so callers (and a host app
+            // resuming over ssh) only proceed once a real session will succeed.
+            if Self::ssh_banner_ok(&addr) {
                 return Ok(port);
             }
             std::thread::sleep(Duration::from_millis(500));
         }
         bail!("timed out waiting for SSH on 127.0.0.1:{port}")
+    }
+
+    /// Connect and confirm the peer actually speaks SSH (sends an `SSH-` banner),
+    /// not just that the forwarded TCP port accepted.
+    fn ssh_banner_ok(addr: &std::net::SocketAddr) -> bool {
+        use std::io::Read;
+        let Ok(mut stream) = TcpStream::connect_timeout(addr, Duration::from_secs(2)) else {
+            return false;
+        };
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+        let mut buf = [0u8; 4];
+        matches!(stream.read(&mut buf), Ok(n) if n == 4) && &buf == b"SSH-"
     }
 
     /// Build an `ssh` command into the running box. `command` runs non-interactively
@@ -278,6 +298,12 @@ impl Vm {
         std::fs::remove_dir_all(&self.paths.dir)
             .with_context(|| format!("removing {}", self.paths.dir.display()))?;
         std::fs::remove_dir_all(&self.paths.runtime_dir).ok();
+        // The box's generated launchers now point at a box that no longer exists;
+        // remove them so they don't linger as dead menu entries. (Cascades for the
+        // CLI `potjie rm` too, not just the GUI.)
+        if let Err(e) = crate::desktop::remove_wrappers_for_box(&self.cfg.name) {
+            eprintln!("warning: could not remove launchers for '{}': {e}", self.cfg.name);
+        }
         Ok(())
     }
 }

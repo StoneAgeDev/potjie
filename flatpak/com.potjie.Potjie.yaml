@@ -1,0 +1,59 @@
+app-id: com.potjie.Potjie
+runtime: org.gnome.Platform
+runtime-version: '50'
+sdk: org.gnome.Sdk
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.rust-stable
+command: potjie-wrapper
+
+finish-args:
+  # Display — wayland primary, x11 for X-forwarded guest apps
+  - --socket=wayland
+  - --socket=x11
+  - --share=ipc
+
+  # COARSE — tighten in later passes:
+  - --filesystem=host   # ~/.potjie, ~/.ssh, ~/.local/share/applications, /proc, host tools
+  - --device=all        # /dev/kvm + /dev/dri
+  - --share=network     # slirp user-space VM networking + SSH forwards
+
+  # Session bus (notifications, XDG portals), SSH agent
+  - --socket=session-bus
+  - --socket=ssh-auth
+
+  # Daemon spawner must find the bundled potjie binary, not any host copy
+  - --env=POTJIE_BIN=/app/bin/potjie
+
+build-options:
+  append-path: /usr/lib/sdk/rust-stable/bin
+  env:
+    CARGO_HOME: /run/build/potjie/cargo
+    CARGO_NET_OFFLINE: 'true'
+
+modules:
+  - name: vte
+    buildsystem: meson
+    config-opts:
+      - -Dgtk4=true
+      - -Dgtk3=false
+      - -Dvapi=false
+    sources:
+      - type: git
+        url: https://gitlab.gnome.org/GNOME/vte.git
+        tag: 0.78.3
+
+  - name: potjie
+    buildsystem: simple
+    build-commands:
+      - cargo --offline build --release
+      - install -Dm755 target/release/potjie     /app/bin/potjie
+      - install -Dm755 target/release/potjie-gtk /app/bin/potjie-gtk
+      - install -Dm755 flatpak/potjie-wrapper.sh /app/bin/potjie-wrapper
+      - install -Dm644 flatpak/com.potjie.Potjie.desktop
+                       /app/share/applications/com.potjie.Potjie.desktop
+    sources:
+      - type: dir
+        path: ..
+      # Generated from Cargo.lock — regenerate when Cargo.lock changes:
+      #   python3 flatpak-cargo-generator.py ../Cargo.lock -o cargo-sources.json
+      - cargo-sources.json

@@ -55,6 +55,11 @@ pub fn ssh_command_opts(
     cmd.arg("-i")
         .arg(&paths.ssh_key)
         .args(["-p", &port.to_string()])
+        // Skip the system-wide ssh_config: its Include'd files (e.g. the
+        // systemd-ssh-proxy stub) can have permissions that OpenSSH treats as
+        // fatal, killing the connection before it starts. We never need proxy
+        // rules or system-level overrides for a localhost-only slirp forward.
+        .args(["-F", "/dev/null"])
         // The guest is freshly minted and reachable only via our forward, so a
         // pinned known_hosts adds nothing; keep it from polluting ~/.ssh.
         .args(["-o", "StrictHostKeyChecking=no"])

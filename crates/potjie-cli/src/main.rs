@@ -7,6 +7,7 @@
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use potjie_core::config::{Forward, ForwardDirection};
 use potjie_core::{guard, BoxConfig, Vm};
 
 #[derive(Parser)]
@@ -49,6 +50,13 @@ enum Cmd {
     /// and not decrypted/reachable anywhere).
     Verify { name: String },
 
+    /// Manage a box's SSH port forwards (host↔guest). Changes apply live to a
+    /// running box (no restart) and persist for next boot.
+    Forward {
+        #[command(subcommand)]
+        action: ForwardCmd,
+    },
+
     /// Permanently delete a box.
     Rm { name: String },
 
@@ -60,6 +68,37 @@ enum Cmd {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
         command: Vec<String>,
     },
+
+    /// Internal: run the guard daemon. Auto-spawned (detached) by the first
+    /// client that needs it; not meant to be invoked by hand.
+    #[command(name = "daemon", hide = true)]
+    Daemon,
+}
+
+#[derive(Subcommand)]
+enum ForwardCmd {
+    /// List a box's configured forwards (with their index, for `rm`).
+    List { name: String },
+    /// Add a forward. Default is host→guest (LocalForward, `-L`); pass --remote
+    /// for guest→host (RemoteForward, `-R`).
+    Add {
+        name: String,
+        /// Port the listening side binds.
+        listen_port: u16,
+        /// Destination port on the far side of the tunnel.
+        dest_port: u16,
+        /// Destination host on the far side (default: loopback).
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+        /// Make this guest→host (RemoteForward) instead of host→guest.
+        #[arg(long)]
+        remote: bool,
+        /// Optional human label.
+        #[arg(long)]
+        label: Option<String>,
+    },
+    /// Remove a forward by its index in `forward list`.
+    Rm { name: String, index: usize },
 }
 
 fn main() -> Result<()> {
@@ -73,8 +112,10 @@ fn main() -> Result<()> {
         Cmd::Run { name, command } => run(&name, &command),
         Cmd::Down { name } => down(&name),
         Cmd::Verify { name } => verify(&name),
+        Cmd::Forward { action } => forward(action),
         Cmd::Rm { name } => rm(&name),
         Cmd::RunTracked { command } => run_tracked(&command),
+        Cmd::Daemon => potjie_daemon::run(),
     }
 }
 
@@ -314,6 +355,57 @@ fn down(name: &str) -> Result<()> {
     guard::force_stop(name)?;
     println!("Box '{name}' stopped and re-locked.");
     Ok(())
+}
+
+fn forward(action: ForwardCmd) -> Result<()> {
+    match action {
+        ForwardCmd::List { name } => {
+            let fwds = guard::get_forwards(&name)?;
+            if fwds.is_empty() {
+                println!("No forwards configured for '{name}'.");
+                return Ok(());
+            }
+            println!("IDX  FORWARD");
+            for (i, f) in fwds.iter().enumerate() {
+                println!("{i:<4} {}", f.summary());
+            }
+            Ok(())
+        }
+        ForwardCmd::Add { name, listen_port, dest_port, host, remote, label } => {
+            if listen_port == 0 || dest_port == 0 {
+                anyhow::bail!("ports must be between 1 and 65535");
+            }
+            let fwd = Forward {
+                direction: if remote {
+                    ForwardDirection::Remote
+                } else {
+                    ForwardDirection::Local
+                },
+                listen_port,
+                dest_host: host,
+                dest_port,
+                label,
+            };
+            let mut fwds = guard::get_forwards(&name)?;
+            if fwds.contains(&fwd) {
+                anyhow::bail!("that forward already exists");
+            }
+            fwds.push(fwd.clone());
+            guard::set_forwards(&name, fwds)?;
+            println!("Added: {}", fwd.summary());
+            Ok(())
+        }
+        ForwardCmd::Rm { name, index } => {
+            let mut fwds = guard::get_forwards(&name)?;
+            if index >= fwds.len() {
+                anyhow::bail!("no forward at index {index}; see `potjie forward list {name}`");
+            }
+            let removed = fwds.remove(index);
+            guard::set_forwards(&name, fwds)?;
+            println!("Removed: {}", removed.summary());
+            Ok(())
+        }
+    }
 }
 
 fn rm(name: &str) -> Result<()> {

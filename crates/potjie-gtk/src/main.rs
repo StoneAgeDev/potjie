@@ -26,9 +26,13 @@ fn main() -> glib::ExitCode {
     // Wrapper mode: `potjie-gtk --launch <box> <app-id>`.
     let args: Vec<String> = std::env::args().collect();
     if args.get(1).map(String::as_str) == Some("--launch") {
+        // NON_UNIQUE: each `--launch` wrapper is an independent headless process.
+        // Without this it would register the unique APP_ID bus name and become the
+        // "primary" instance — a lingering wrapper then steals activations from the
+        // real GUI (and other wrappers), so the main window never opens.
         let app = adw::Application::builder()
             .application_id(APP_ID)
-            .flags(gio::ApplicationFlags::HANDLES_COMMAND_LINE)
+            .flags(gio::ApplicationFlags::HANDLES_COMMAND_LINE | gio::ApplicationFlags::NON_UNIQUE)
             .build();
         let argv = args.clone();
         app.connect_command_line(move |app, _| {

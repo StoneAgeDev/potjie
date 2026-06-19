@@ -1,0 +1,7 @@
+[Desktop Entry]
+Name=Potjie
+Comment=Encrypted virtual machine manager
+Exec=potjie-wrapper
+Icon=com.potjie.Potjie
+Type=Application
+Categories=System;Emulator;

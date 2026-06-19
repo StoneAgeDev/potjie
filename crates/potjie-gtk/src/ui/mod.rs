@@ -5,15 +5,15 @@ pub mod launch;
 use gtk::glib::clone;
 use gtk::prelude::*;
 use gtk::{
-    gio, glib, Align, ApplicationWindow, Box as GtkBox, Button, Entry, Expander, HeaderBar,
-    Label, ListBox, Notebook, Orientation, ScrolledWindow, SelectionMode, Spinner, SpinButton,
-    TextView,
+    gio, glib, Align, ApplicationWindow, Box as GtkBox, Button, DropDown, Entry, Expander,
+    HeaderBar, Label, ListBox, Notebook, Orientation, ScrolledWindow, SelectionMode, Spinner,
+    SpinButton, TextView,
 };
 use vte::prelude::*;
+use potjie_core::config::{Forward, ForwardDirection};
 use potjie_core::desktop::{DesktopEntry, Kind};
 use potjie_core::{guard, Vm};
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::rc::Rc;
 
@@ -38,17 +38,21 @@ where
     });
 }
 
-/// Path to the `potjie` CLI: prefer one next to this binary, else `PATH`.
+/// Path to the multicall `potjie` binary (`POTJIE_BIN` → sibling `potjie` →
+/// `PATH`). Shared with the daemon-spawn resolver so both agree.
 pub fn potjie_cli() -> PathBuf {
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            let cand = dir.join("potjie");
-            if cand.exists() {
-                return cand;
-            }
-        }
+    PathBuf::from(potjie_core::tools::potjie_bin())
+}
+
+/// Path to embed in generated `.desktop` launchers as the thing to re-exec. Under
+/// an AppImage, `current_exe()` is the per-launch FUSE mountpoint (gone next run),
+/// so prefer `$APPIMAGE` — the stable path of the `.AppImage` file itself, which
+/// AppRun re-enters as this GUI binary.
+pub fn launcher_path() -> PathBuf {
+    if let Ok(p) = std::env::var("APPIMAGE") {
+        return PathBuf::from(p);
     }
-    PathBuf::from("potjie")
+    std::env::current_exe().unwrap_or_else(|_| PathBuf::from("potjie-gtk"))
 }
 
 // ---- modal prompts -------------------------------------------------------
@@ -263,9 +267,17 @@ fn guard_markup(name: &str) -> String {
     )
 }
 
-/// Is the box currently running (daemon truth)?
-fn box_running(name: &str) -> bool {
-    guard::status(name).map(|s| s.running).unwrap_or(false)
+/// Would *our* action actually stop and re-lock the box? True only when it's
+/// running and we appear to hold the only lease, so releasing it (by leaving the
+/// Shell tab, closing the window, or navigating away) brings the daemon's count
+/// to zero. When other clients also hold the box open — e.g. a host-app wrapper
+/// like Zed that leased it independently — none of those actions re-lock it, so
+/// there is nothing to guard against and we must not prompt.
+///
+/// While the Shell tab is active its `potjie ssh` child counts as one lease, so
+/// any *additional* holder makes `leases > 1` and this returns false.
+fn would_relock(name: &str) -> bool {
+    guard::status(name).map(|s| s.running && s.leases <= 1).unwrap_or(false)
 }
 
 // ---- main window ---------------------------------------------------------
@@ -443,7 +455,7 @@ pub fn build_main_window(app: &adw::Application) {
                 Box::new(move || show_detail(target))
             };
             match cur {
-                Some(name) if box_running(&name) => {
+                Some(name) if would_relock(&name) => {
                     let cancel: Box<dyn FnOnce()> = {
                         let reselect_current = reselect_current.clone();
                         Box::new(move || reselect_current())
@@ -479,7 +491,7 @@ pub fn build_main_window(app: &adw::Application) {
             };
             let cur = current_box.borrow().clone();
             match cur {
-                Some(name) if box_running(&name) => {
+                Some(name) if would_relock(&name) => {
                     confirm.ask(&guard_markup(&name), open_form, Box::new(|| {}));
                 }
                 _ => open_form(),
@@ -496,7 +508,7 @@ pub fn build_main_window(app: &adw::Application) {
             }
             let cur = current_box.borrow().clone();
             match cur {
-                Some(name) if box_running(&name) => {
+                Some(name) if would_relock(&name) => {
                     let w = w.clone();
                     confirm.ask(
                         &format!(
@@ -514,62 +526,27 @@ pub fn build_main_window(app: &adw::Application) {
         }
     ));
 
-    // Notify on every box start/stop, whatever caused it (UI, CLI, or a wrapper).
-    // The daemon is the source of truth, so we poll status and fire a desktop
-    // notification on each running-state transition. It also live-updates the
-    // sidebar status dots *in place* — we deliberately do NOT rebuild the sidebar
-    // here (that would drop the selection and tear down the detail panel,
-    // unmapping and thus stopping the Shell tab we just started).
-    start_state_notifier(app, &sidebar);
+    // Live-update the sidebar status dots in place from daemon truth. We
+    // deliberately do NOT rebuild the sidebar here (that would drop the selection
+    // and tear down the detail panel, unmapping and thus stopping the Shell tab we
+    // just started). Start/stop *notifications* are fired by the daemon, not here,
+    // so they happen whatever the trigger (CLI, wrapper) and even with no GUI open.
+    start_sidebar_poller(&sidebar);
 
     window.present();
 }
 
-/// Poll box running-state once a second: send a desktop notification on each
-/// start/stop transition and live-update the sidebar status dot in place.
-fn start_state_notifier(app: &adw::Application, sidebar: &ListBox) {
-    let app = app.clone();
+/// Poll box running-state once a second and live-update each sidebar status dot
+/// in place.
+fn start_sidebar_poller(sidebar: &ListBox) {
     let sidebar = sidebar.clone();
-    let last: Rc<RefCell<HashMap<String, bool>>> = Rc::new(RefCell::new(HashMap::new()));
-    // Seed with current state so we don't notify for boxes already running.
-    for vm in Vm::list().unwrap_or_default() {
-        let running = vm.status().map(|s| s.running).unwrap_or(false);
-        last.borrow_mut().insert(vm.cfg.name, running);
-    }
     glib::timeout_add_seconds_local(1, move || {
-        let mut prev = last.borrow_mut();
         for vm in Vm::list().unwrap_or_default() {
             let running = vm.status().map(|s| s.running).unwrap_or(false);
             set_sidebar_dot(&sidebar, &vm.cfg.name, running);
-            match prev.get(&vm.cfg.name) {
-                Some(&was) if was == running => {}
-                Some(_) => {
-                    // Known box that flipped state → notify.
-                    notify(
-                        &app,
-                        &vm.cfg.name,
-                        if running {
-                            format!("Box '{}' started — decrypted and running.", vm.cfg.name)
-                        } else {
-                            format!("Box '{}' stopped — re-locked and sealed.", vm.cfg.name)
-                        },
-                    );
-                    prev.insert(vm.cfg.name.clone(), running);
-                }
-                None => {
-                    // First time we've seen this box; record without notifying.
-                    prev.insert(vm.cfg.name.clone(), running);
-                }
-            }
         }
         glib::ControlFlow::Continue
     });
-}
-
-fn notify(app: &adw::Application, box_name: &str, body: String) {
-    let n = gio::Notification::new("Potjie");
-    n.set_body(Some(&body));
-    app.send_notification(Some(&format!("potjie-{box_name}")), &n);
 }
 
 /// Inline new-box form rendered in the detail panel.
@@ -798,7 +775,7 @@ struct ShellCtl {
     active: Rc<dyn Fn() -> bool>,
 }
 
-const SHELL_PAGE: u32 = 2;
+const SHELL_PAGE: u32 = 3;
 
 fn build_detail(
     window: &ApplicationWindow,
@@ -819,18 +796,21 @@ fn build_detail(
     nb.set_vexpand(true);
     wrapper.append(&nb);
 
-    let (overview_page, refresh_overview) = overview_tab(window, vm.clone(), do_refresh.clone());
+    let (overview_page, refresh_overview) =
+        overview_tab(window, vm.clone(), do_refresh.clone(), confirm.clone());
     let (shell_page, shell) = shell_tab(vm.clone());
 
     nb.append_page(&overview_page, Some(&Label::new(Some("Overview"))));
     nb.append_page(&apps_tab(window, vm.clone()), Some(&Label::new(Some("Apps"))));
+    nb.append_page(&ports_tab(vm.clone()), Some(&Label::new(Some("Ports"))));
     nb.append_page(&shell_page, Some(&Label::new(Some("Shell"))));
 
     // The box runs only while the Shell tab is current. Switching away while it's
     // running asks first (shared inline y/n bar) before stopping. We re-enter
     // switch_page when reverting, so guard against asking twice.
     nb.connect_switch_page(clone!(
-        #[strong] shell, #[strong] refresh_overview, #[strong] confirm, #[weak] nb,
+        #[strong] shell, #[strong] refresh_overview, #[strong] confirm, #[strong] vm,
+        #[weak] nb,
         move |_, _, page_num| {
             if page_num == SHELL_PAGE {
                 // Returning to the shell cancels any pending "stop the VM?" prompt.
@@ -850,16 +830,24 @@ fn build_detail(
                         );
                     })
                 };
-                let back_to_shell: Box<dyn FnOnce()> = {
-                    let nb = nb.clone();
-                    Box::new(move || nb.set_current_page(Some(SHELL_PAGE)))
-                };
-                confirm.ask(
-                    "\u{26a0}  Leaving the Shell tab stops and re-locks the VM.  \
-                     Stop it?   <b>y</b> = stop   \u{00b7}   <b>n</b> = keep it running",
-                    stop_now,
-                    back_to_shell,
-                );
+                // Only warn if leaving would actually re-lock the box. When a host
+                // app (e.g. Zed) also holds a lease, ending this shell just closes
+                // the ssh session — the box stays up — so don't trap the user
+                // behind a prompt about a stop that won't happen.
+                if would_relock(&vm.cfg.name) {
+                    let back_to_shell: Box<dyn FnOnce()> = {
+                        let nb = nb.clone();
+                        Box::new(move || nb.set_current_page(Some(SHELL_PAGE)))
+                    };
+                    confirm.ask(
+                        "\u{26a0}  Leaving the Shell tab stops and re-locks the VM.  \
+                         Stop it?   <b>y</b> = stop   \u{00b7}   <b>n</b> = keep it running",
+                        stop_now,
+                        back_to_shell,
+                    );
+                } else {
+                    stop_now();
+                }
             } else if !confirm.is_confirming() {
                 refresh_overview();
             }
@@ -879,6 +867,7 @@ fn overview_tab(
     window: &ApplicationWindow,
     vm: Rc<Vm>,
     do_refresh: impl Fn() + Clone + 'static,
+    confirm: Confirm,
 ) -> (GtkBox, Rc<dyn Fn()>) {
     let page = GtkBox::new(Orientation::Vertical, 12);
     page.set_margin_top(16);
@@ -961,14 +950,40 @@ fn overview_tab(
     refresh_overview();
 
     delete.connect_clicked(clone!(
-        #[strong] vm, #[strong] do_refresh, #[weak] window,
+        #[strong] vm, #[strong] do_refresh, #[strong] confirm, #[strong] window,
         move |_| {
-            let vm2 = (*vm).clone();
-            run_async(move || vm2.delete().map_err(|e| e.to_string()),
-                clone!(#[strong] do_refresh, move |res: Result<(), String>| {
-                    if let Err(e) = res { info(&window, "Delete failed", &e); }
-                    do_refresh();
-                }));
+            // Count the launchers we'll cascade-delete so the prompt is honest.
+            let n = potjie_core::desktop::list_wrappers(Some(&vm.cfg.name))
+                .map(|w| w.len())
+                .unwrap_or(0);
+            let extra = match n {
+                0 => String::new(),
+                1 => " and its 1 launcher".into(),
+                _ => format!(" and its {n} launchers"),
+            };
+            let do_delete: Box<dyn FnOnce()> = {
+                let vm = vm.clone();
+                let do_refresh = do_refresh.clone();
+                let window = window.clone();
+                Box::new(move || {
+                    let vm2 = (*vm).clone();
+                    run_async(move || vm2.delete().map_err(|e| e.to_string()),
+                        clone!(#[strong] do_refresh, move |res: Result<(), String>| {
+                            if let Err(e) = res { info(&window, "Delete failed", &e); }
+                            do_refresh();
+                        }));
+                })
+            };
+            confirm.ask(
+                &format!(
+                    "\u{26a0}  Permanently delete box \u{2018}{}\u{2019}{extra}? This erases the \
+                     encrypted disk and cannot be undone.   <b>y</b> = delete   \u{00b7}   \
+                     <b>n</b> = cancel",
+                    vm.cfg.name
+                ),
+                do_delete,
+                Box::new(|| {}),
+            );
         }
     ));
 
@@ -992,20 +1007,98 @@ fn apps_tab(window: &ApplicationWindow, vm: Rc<Vm>) -> GtkBox {
     hint.set_halign(Align::Start);
     page.append(&hint);
 
+    // Existing launchers for this box, each removable in place.
+    let (wrappers_box, refresh_wrappers) = wrappers_section(vm.clone());
+    page.append(&wrappers_box);
+
     page.append(&app_section(
         window, vm.clone(), Kind::Host,
         "Host applications  —  run on the host, connected into the box",
+        refresh_wrappers.clone(),
     ));
     page.append(&app_section(
         window, vm, Kind::Vm,
         "Box applications  —  run inside the box, shown on the host",
+        refresh_wrappers,
     ));
     page
 }
 
+/// The list of launchers already created for this box, each with a Remove
+/// button. Returns the widget and a closure that re-reads the list from disk
+/// (called after a new launcher is created elsewhere in the tab).
+fn wrappers_section(vm: Rc<Vm>) -> (GtkBox, Rc<dyn Fn()>) {
+    let container = GtkBox::new(Orientation::Vertical, 6);
+    let title = Label::new(None);
+    title.set_markup("<b>Created launchers</b>");
+    title.set_halign(Align::Start);
+    container.append(&title);
+
+    let list = ListBox::new();
+    list.set_selection_mode(SelectionMode::None);
+    list.add_css_class("boxed-list");
+    container.append(&list);
+
+    let refresh: Rc<dyn Fn()> = {
+        let list = list.clone();
+        let vm = vm.clone();
+        Rc::new(move || {
+            while let Some(c) = list.first_child() {
+                list.remove(&c);
+            }
+            let wrappers =
+                potjie_core::desktop::list_wrappers(Some(&vm.cfg.name)).unwrap_or_default();
+            if wrappers.is_empty() {
+                list.append(&placeholder("No launchers yet — create one from the lists below."));
+                return;
+            }
+            for w in wrappers {
+                let rowbox = GtkBox::new(Orientation::Horizontal, 8);
+                rowbox.set_margin_top(6);
+                rowbox.set_margin_bottom(6);
+                rowbox.set_margin_start(10);
+                rowbox.set_margin_end(10);
+                let tag = match w.kind {
+                    Kind::Host => "host",
+                    Kind::Vm => "box",
+                };
+                let name = Label::new(Some(&format!("{}  ({tag})", w.name)));
+                name.set_halign(Align::Start);
+                name.set_hexpand(true);
+                let remove = Button::from_icon_name("user-trash-symbolic");
+                remove.add_css_class("flat");
+                remove.set_tooltip_text(Some("Remove this launcher"));
+                rowbox.append(&name);
+                rowbox.append(&remove);
+                let row = gtk::ListBoxRow::new();
+                row.set_selectable(false);
+                row.set_child(Some(&rowbox));
+                let path = w.path.clone();
+                remove.connect_clicked(clone!(
+                    #[weak] list, #[weak] row,
+                    move |_| {
+                        if potjie_core::desktop::remove_wrapper(&path).is_ok() {
+                            list.remove(&row);
+                        }
+                    }
+                ));
+                list.append(&row);
+            }
+        })
+    };
+    refresh();
+    (container, refresh)
+}
+
 /// A collapsible (collapsed by default) app list that scans the first time it is
 /// expanded.
-fn app_section(window: &ApplicationWindow, vm: Rc<Vm>, kind: Kind, title: &str) -> Expander {
+fn app_section(
+    window: &ApplicationWindow,
+    vm: Rc<Vm>,
+    kind: Kind,
+    title: &str,
+    refresh_wrappers: Rc<dyn Fn()>,
+) -> Expander {
     let expander = Expander::new(Some(title));
     expander.set_expanded(false);
 
@@ -1023,6 +1116,7 @@ fn app_section(window: &ApplicationWindow, vm: Rc<Vm>, kind: Kind, title: &str) 
     let scanned = Rc::new(RefCell::new(false));
     expander.connect_expanded_notify(clone!(
         #[strong] vm, #[strong] list, #[strong] scanned, #[weak] window,
+        #[strong] refresh_wrappers,
         move |exp| {
             // The open section should fill the available vertical space; a closed
             // one stays compact so the other can grow.
@@ -1045,6 +1139,7 @@ fn app_section(window: &ApplicationWindow, vm: Rc<Vm>, kind: Kind, title: &str) 
                     Kind::Vm => vm_scan.list_guest_apps().map_err(|e| e.to_string()),
                 },
                 clone!(#[strong] vm, #[strong] list, #[strong] scanned, #[weak] window,
+                #[strong] refresh_wrappers,
                 move |res: Result<Vec<DesktopEntry>, String>| {
                     match res {
                         Err(e) => {
@@ -1062,8 +1157,9 @@ fn app_section(window: &ApplicationWindow, vm: Rc<Vm>, kind: Kind, title: &str) 
                                 row.add_css_class("flat");
                                 let entry = entry.clone();
                                 row.connect_clicked(clone!(
-                                    #[strong] vm, #[weak] window,
-                                    move |_| make_wrapper(&window, vm.clone(), kind, entry.clone())));
+                                    #[strong] vm, #[weak] window, #[strong] refresh_wrappers,
+                                    move |_| make_wrapper(&window, vm.clone(), kind, entry.clone(),
+                                        refresh_wrappers.clone())));
                                 list.append(&row);
                             }
                         }
@@ -1094,20 +1190,334 @@ fn set_rows(list: &ListBox, rows: &[Label]) {
     }
 }
 
-fn make_wrapper(window: &ApplicationWindow, vm: Rc<Vm>, kind: Kind, entry: DesktopEntry) {
+fn make_wrapper(
+    window: &ApplicationWindow,
+    vm: Rc<Vm>,
+    kind: Kind,
+    entry: DesktopEntry,
+    refresh_wrappers: Rc<dyn Fn()>,
+) {
     prompt_text(window, "Launcher name",
         &format!("Name for the launcher for '{}':", entry.name),
         false,
         clone!(#[weak] window, move |name| {
             let Some(name) = name.filter(|n| !n.trim().is_empty()) else { return; };
-            let launcher = std::env::current_exe()
-                .unwrap_or_else(|_| PathBuf::from("potjie-gtk"));
+            let launcher = launcher_path();
             match potjie_core::desktop::create_wrapper(&vm.cfg.name, kind, &entry, name.trim(), &launcher) {
-                Ok(path) => info(&window, "Launcher created",
-                    &format!("Created:\n{}", path.display())),
+                Ok(path) => {
+                    info(&window, "Launcher created", &format!("Created:\n{}", path.display()));
+                    refresh_wrappers(); // show it in the "Created launchers" list right away
+                }
                 Err(e) => info(&window, "Could not create launcher", &e.to_string()),
             }
         }));
+}
+
+/// The Ports tab: view, add, and remove the box's SSH port forwards. Edits are
+/// sent to the daemon, which persists them and — if the box is running — applies
+/// the change live over the SSH control master (no restart).
+fn ports_tab(vm: Rc<Vm>) -> GtkBox {
+    let page = GtkBox::new(Orientation::Vertical, 12);
+    page.set_margin_top(16);
+    page.set_margin_bottom(16);
+    page.set_margin_start(16);
+    page.set_margin_end(16);
+
+    let hint = Label::new(Some(
+        "Forwards tunnel over the box's SSH connection while it runs. Pick \u{201c}Host \
+         \u{2192} Box\u{201d} to reach a service running inside the box from this machine \
+         (e.g. a dev server), or \u{201c}Box \u{2192} Host\u{201d} to let something inside \
+         the box reach a service on this machine. Changes apply live to a running box and \
+         persist for next boot.",
+    ));
+    hint.set_wrap(true);
+    hint.set_halign(Align::Start);
+    page.append(&hint);
+
+    // Status line for save feedback (errors, "applied", etc.).
+    let status = Label::new(None);
+    status.set_halign(Align::Start);
+    status.set_wrap(true);
+    status.add_css_class("dim-label");
+
+    // Source of truth for the editor: the daemon's persisted set if reachable,
+    // else the config we loaded with.
+    let forwards: Rc<RefCell<Vec<Forward>>> = Rc::new(RefCell::new(
+        guard::get_forwards(&vm.cfg.name).unwrap_or_else(|_| vm.cfg.forwards.clone()),
+    ));
+
+    // Current forwards, each removable in place.
+    let list = ListBox::new();
+    list.set_selection_mode(SelectionMode::None);
+    list.add_css_class("boxed-list");
+    list.set_margin_top(6);
+
+    // `refresh` rebuilds the rows; both `apply` and each row's Remove button need
+    // to call it, so hold a self-reference those closures can invoke.
+    let refresh_holder: Rc<RefCell<Option<Rc<dyn Fn()>>>> = Rc::new(RefCell::new(None));
+
+    // Apply a *proposed* forward set to the daemon, then — only once it confirms —
+    // commit it to the in-memory list and redraw. The UI therefore always mirrors
+    // what the daemon actually persisted: a failed write leaves the rows untouched
+    // and shows a clear error, instead of optimistically dropping a row that's
+    // still in `box.json` (which made deletes look like they "came back").
+    let apply: Rc<dyn Fn(Vec<Forward>)> = {
+        let forwards = forwards.clone();
+        let status = status.clone();
+        let name = vm.cfg.name.clone();
+        let refresh_holder = refresh_holder.clone();
+        Rc::new(move |set: Vec<Forward>| {
+            let name = name.clone();
+            let to_send = set.clone();
+            status.remove_css_class("error");
+            status.set_text("Applying\u{2026}");
+            run_async(
+                move || guard::set_forwards(&name, to_send).map_err(|e| e.to_string()),
+                clone!(
+                    #[strong] forwards, #[strong] status, #[strong] refresh_holder,
+                    move |res: Result<(), String>| {
+                        match res {
+                            Ok(()) => {
+                                *forwards.borrow_mut() = set;
+                                status.remove_css_class("error");
+                                status.set_text("Saved. Live on the box if it's running; \
+                                                 applied on next boot otherwise.");
+                            }
+                            Err(e) => {
+                                status.add_css_class("error");
+                                status.set_text(&format!(
+                                    "Could not apply \u{2014} nothing changed: {e}"
+                                ));
+                            }
+                        }
+                        if let Some(r) = refresh_holder.borrow().as_ref() {
+                            r();
+                        }
+                    }
+                ),
+            );
+        })
+    };
+
+    let refresh: Rc<dyn Fn()> = {
+        let list = list.clone();
+        let forwards = forwards.clone();
+        let apply = apply.clone();
+        Rc::new(move || {
+            while let Some(c) = list.first_child() {
+                list.remove(&c);
+            }
+            if forwards.borrow().is_empty() {
+                list.append(&placeholder("No forwards yet \u{2014} add one below."));
+                return;
+            }
+            let rows: Vec<(usize, String)> = forwards
+                .borrow()
+                .iter()
+                .enumerate()
+                .map(|(i, f)| (i, f.summary()))
+                .collect();
+            for (i, summary) in rows {
+                let rowbox = GtkBox::new(Orientation::Horizontal, 8);
+                rowbox.set_margin_top(6);
+                rowbox.set_margin_bottom(6);
+                rowbox.set_margin_start(10);
+                rowbox.set_margin_end(10);
+                let label = Label::new(Some(&summary));
+                label.set_halign(Align::Start);
+                label.set_hexpand(true);
+                label.set_selectable(true);
+                let remove = Button::from_icon_name("user-trash-symbolic");
+                remove.add_css_class("flat");
+                remove.set_tooltip_text(Some("Remove this forward"));
+                rowbox.append(&label);
+                rowbox.append(&remove);
+                let row = gtk::ListBoxRow::new();
+                row.set_selectable(false);
+                row.set_child(Some(&rowbox));
+                remove.connect_clicked(clone!(
+                    #[strong] forwards, #[strong] apply,
+                    move |_| {
+                        let mut set = forwards.borrow().clone();
+                        if i < set.len() {
+                            set.remove(i);
+                            apply(set);
+                        }
+                    }
+                ));
+                list.append(&row);
+            }
+        })
+    };
+    *refresh_holder.borrow_mut() = Some(refresh.clone());
+    refresh();
+
+    page.append(&list);
+
+    // ---- Add form -------------------------------------------------------
+    // The form speaks in plain "Host port / Box port" terms so the meaning of each
+    // field never silently swaps with the direction (the old listen-vs-destination
+    // framing was the confusing part). The direction dropdown just flips which way
+    // traffic flows, a live sentence spells out the result, and the rarely-touched
+    // destination host hides in an inline "Advanced" expander.
+
+    // Direction: index 0 = Host → Box (Local), index 1 = Box → Host (Remote).
+    let dir = DropDown::from_strings(&["Host \u{2192} Box", "Box \u{2192} Host"]);
+    dir.set_tooltip_text(Some(
+        "Host \u{2192} Box: reach a service running inside the box from this machine.\n\
+         Box \u{2192} Host: let something inside the box reach a service on this machine.",
+    ));
+
+    let host_port = SpinButton::with_range(1.0, 65535.0, 1.0);
+    host_port.set_value(8000.0);
+    host_port.set_tooltip_text(Some("Port on this machine"));
+
+    let box_port = SpinButton::with_range(1.0, 65535.0, 1.0);
+    box_port.set_value(8000.0);
+    box_port.set_tooltip_text(Some("Port inside the box"));
+
+    let label_entry = Entry::new();
+    label_entry.set_placeholder_text(Some("label (optional)"));
+    label_entry.set_width_chars(14);
+
+    let add = Button::with_label("Add forward");
+    add.add_css_class("suggested-action");
+
+    // Two-row grid so every column lines up: captions on top, controls beneath.
+    //   Host port | Direction | Box port |        |
+    //    [8000]   | [Host→Box]|  [8000]  | [label]| [Add]
+    let caption = |text: &str| {
+        let l = Label::new(Some(text));
+        l.add_css_class("dim-label");
+        l.set_halign(Align::Start);
+        l
+    };
+    let form = gtk::Grid::new();
+    form.set_row_spacing(2);
+    form.set_column_spacing(8);
+    form.set_margin_top(8);
+    form.attach(&caption("Host port"), 0, 0, 1, 1);
+    form.attach(&caption("Direction"), 1, 0, 1, 1);
+    form.attach(&caption("Box port"), 2, 0, 1, 1);
+    form.attach(&host_port, 0, 1, 1, 1);
+    form.attach(&dir, 1, 1, 1, 1);
+    form.attach(&box_port, 2, 1, 1, 1);
+    form.attach(&label_entry, 3, 1, 1, 1);
+    form.attach(&add, 4, 1, 1, 1);
+    page.append(&form);
+
+    // Advanced: destination host (defaults to loopback on the far side).
+    let dest_host = Entry::new();
+    dest_host.set_text("127.0.0.1");
+    dest_host.set_width_chars(16);
+    dest_host.set_tooltip_text(Some(
+        "Address of the service on the destination side. Default 127.0.0.1 \
+         (loopback) is right unless the service listens elsewhere.",
+    ));
+    let adv_row = GtkBox::new(Orientation::Horizontal, 8);
+    let adv_caption = Label::new(Some("Destination host"));
+    adv_caption.add_css_class("dim-label");
+    adv_row.append(&adv_caption);
+    adv_row.append(&dest_host);
+    let advanced = Expander::new(Some("Advanced"));
+    advanced.set_child(Some(&adv_row));
+    advanced.set_margin_top(4);
+    page.append(&advanced);
+
+    // Live plain-language description of the forward being built.
+    let explain = Label::new(None);
+    explain.set_halign(Align::Start);
+    explain.set_wrap(true);
+    explain.add_css_class("dim-label");
+    explain.set_margin_top(4);
+    page.append(&explain);
+    let update_explain: Rc<dyn Fn()> = {
+        let dir = dir.clone();
+        let host_port = host_port.clone();
+        let box_port = box_port.clone();
+        let explain = explain.clone();
+        Rc::new(move || {
+            let h = host_port.value() as u16;
+            let b = box_port.value() as u16;
+            let text = if dir.selected() == 0 {
+                format!(
+                    "Reach the box's port {b} at localhost:{h} on this machine."
+                )
+            } else {
+                format!(
+                    "Let the box reach this machine's port {h} at localhost:{b} inside the box."
+                )
+            };
+            explain.set_text(&text);
+        })
+    };
+    update_explain();
+    dir.connect_selected_notify(clone!(#[strong] update_explain, move |_| update_explain()));
+
+    // Auto-mirror the host port onto the box port so the common "same port both
+    // sides" case needs no second edit. Mirroring stays on only while the two
+    // values agree; once the box port is set apart, the two move independently.
+    let mirror = Rc::new(Cell::new(true));
+    host_port.connect_value_changed(clone!(
+        #[strong] mirror, #[strong] update_explain, #[weak] box_port,
+        move |hp| {
+            if mirror.get() {
+                box_port.set_value(hp.value());
+            }
+            update_explain();
+        }
+    ));
+    box_port.connect_value_changed(clone!(
+        #[strong] mirror, #[strong] update_explain, #[weak] host_port,
+        move |bp| {
+            mirror.set(bp.value() as u16 == host_port.value() as u16);
+            update_explain();
+        }
+    ));
+
+    page.append(&status);
+
+    let do_add: Rc<dyn Fn()> = {
+        let forwards = forwards.clone();
+        let apply = apply.clone();
+        let status = status.clone();
+        let dir = dir.clone();
+        let host_port = host_port.clone();
+        let box_port = box_port.clone();
+        let dest_host = dest_host.clone();
+        let label_entry = label_entry.clone();
+        Rc::new(move || {
+            let direction = if dir.selected() == 0 {
+                ForwardDirection::Local
+            } else {
+                ForwardDirection::Remote
+            };
+            let host = dest_host.text().trim().to_string();
+            let host = if host.is_empty() { "127.0.0.1".to_string() } else { host };
+            let label = label_entry.text().trim().to_string();
+            let fwd = Forward::from_ports(
+                direction,
+                host_port.value() as u16,
+                box_port.value() as u16,
+                host,
+                if label.is_empty() { None } else { Some(label) },
+            );
+            let mut set = forwards.borrow().clone();
+            if set.contains(&fwd) {
+                status.add_css_class("error");
+                status.set_text("That forward already exists.");
+                return;
+            }
+            set.push(fwd);
+            label_entry.set_text("");
+            apply(set);
+        })
+    };
+    add.connect_clicked(clone!(#[strong] do_add, move |_| do_add()));
+    // Enter in the label field also adds the forward.
+    label_entry.connect_activate(clone!(#[strong] do_add, move |_| do_add()));
+
+    page
 }
 
 fn shell_tab(vm: Rc<Vm>) -> (GtkBox, ShellCtl) {

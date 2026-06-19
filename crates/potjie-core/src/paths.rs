@@ -16,7 +16,7 @@
 //! $XDG_RUNTIME_DIR/potjie/<box>/
 //!     qemu.pid                 pid of the running qemu process
 //!     qmp.sock                 QMP control socket
-//!     ssh.port                 host port forwarded to guest :22
+//!     ssh.port                 host port mapped to guest :22
 //! ```
 
 use anyhow::{Context, Result};

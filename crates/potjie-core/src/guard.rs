@@ -10,6 +10,7 @@
 //! # Ok::<(), anyhow::Error>(())
 //! ```
 
+use crate::config::Forward;
 use crate::paths;
 use crate::protocol::{BoxStatus, Request, Response, SOCKET_NAME};
 use crate::tools;
@@ -67,8 +68,8 @@ fn connect() -> Result<UnixStream> {
     }
 }
 
-/// Spawn `potjied` detached from this process, so it outlives short-lived CLI
-/// invocations and survives the launching client.
+/// Spawn `potjie daemon` detached from this process, so it outlives short-lived
+/// CLI invocations and survives the launching client.
 pub fn ensure_daemon() -> Result<()> {
     use std::os::unix::process::CommandExt;
     let log = paths::runtime_root()?.join("potjied.log");
@@ -79,7 +80,8 @@ pub fn ensure_daemon() -> Result<()> {
         .open(&log)
         .ok();
 
-    let mut cmd = std::process::Command::new(tools::potjied());
+    let mut cmd = std::process::Command::new(tools::potjie_bin());
+    cmd.arg("daemon");
     cmd.stdin(std::process::Stdio::null());
     if let Some(f) = out {
         let f2 = f.try_clone().ok();
@@ -163,6 +165,30 @@ pub fn status(box_name: &str) -> Result<BoxStatus> {
 pub fn list() -> Result<Vec<BoxStatus>> {
     match oneshot(Request::List)? {
         Response::List { boxes } => Ok(boxes),
+        Response::Error { message } => bail!("{message}"),
+        other => bail!("unexpected response: {other:?}"),
+    }
+}
+
+/// Replace a box's port forwards. Persists them and, if the box is running,
+/// applies the change live (no restart).
+pub fn set_forwards(box_name: &str, forwards: Vec<Forward>) -> Result<()> {
+    match oneshot(Request::SetForwards {
+        box_name: box_name.to_string(),
+        forwards,
+    })? {
+        Response::ForwardsSet => Ok(()),
+        Response::Error { message } => bail!("{message}"),
+        other => bail!("unexpected response: {other:?}"),
+    }
+}
+
+/// Read a box's persisted port forwards.
+pub fn get_forwards(box_name: &str) -> Result<Vec<Forward>> {
+    match oneshot(Request::GetForwards {
+        box_name: box_name.to_string(),
+    })? {
+        Response::Forwards { forwards } => Ok(forwards),
         Response::Error { message } => bail!("{message}"),
         other => bail!("unexpected response: {other:?}"),
     }

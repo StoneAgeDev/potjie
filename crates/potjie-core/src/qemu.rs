@@ -3,11 +3,16 @@
 //! A running box is one headless, daemonized qemu process:
 //!   * root disk: the LUKS qcow2 (key handed in via a `secret` object)
 //!   * cloud-init seed: the CIDATA FAT image, read-only
-//!   * networking: slirp user-mode, with a host port forwarded to guest :22
+//!   * networking: slirp user-mode NAT — user-space, no root
 //!
-//! No privileges, no TAP devices, no bridges — everything is user-space, which
-//! is the whole point. Lifecycle state (pid, forwarded port, QMP socket) lives
-//! on tmpfs under the runtime dir.
+//! QEMU's built-in slirp stack provides NAT with a single host-port forward to
+//! guest :22, so Potjie can always SSH in (a free host port → guest 22) without
+//! needing root, TAP devices, or bridges. Other guest services are reached by
+//! per-box SSH `LocalForward` tunnels configured in the GUI, keeping host port
+//! exposure explicit instead of opening the whole guest to the host.
+//!
+//! Lifecycle state (pids, forwarded port, sockets) lives on tmpfs under the
+//! runtime dir.
 
 use crate::disk;
 use crate::paths::{create_private_dir, BoxPaths};
@@ -28,7 +33,7 @@ pub struct Status {
     pub ssh_port: Option<u16>,
 }
 
-/// Boot the box. Returns the host port forwarded to the guest's SSH.
+/// Boot the box. Returns the host port that reaches guest SSH (port 22).
 /// Errors if the box is already running.
 pub fn start(paths: &BoxPaths, cfg: &crate::config::BoxConfig, passphrase: &str) -> Result<u16> {
     if status(paths)?.running {
@@ -36,7 +41,6 @@ pub fn start(paths: &BoxPaths, cfg: &crate::config::BoxConfig, passphrase: &str)
     }
     create_private_dir(&paths.runtime_dir)?;
 
-    let port = free_port()?;
     let secret = SecretFile::new(passphrase)?;
     let node = "disk0";
     let (secret_arg, blockdev_arg) = disk::blockdev_args(&paths.disk, &secret, node);
@@ -67,12 +71,8 @@ pub fn start(paths: &BoxPaths, cfg: &crate::config::BoxConfig, passphrase: &str)
         ),
     ]);
 
-    // slirp user networking with host->guest SSH forward.
-    cmd.args([
-        "-netdev",
-        &format!("user,id=net0,hostfwd=tcp:127.0.0.1:{port}-:22"),
-    ])
-    .args(["-device", "virtio-net-pci,netdev=net0"]);
+    // Networking: slirp user-mode NAT with a host forward to guest SSH.
+    let ssh_port = wire_network(&mut cmd, paths)?;
 
     // Headless, backgrounded, controllable.
     cmd.arg("-display").arg("none");
@@ -89,9 +89,9 @@ pub fn start(paths: &BoxPaths, cfg: &crate::config::BoxConfig, passphrase: &str)
     // so the secret file is consumed by the time this returns.
     run(&mut cmd).context("launching qemu")?;
 
-    std::fs::write(&paths.ssh_port_file, port.to_string())
+    std::fs::write(&paths.ssh_port_file, ssh_port.to_string())
         .with_context(|| format!("writing {}", paths.ssh_port_file.display()))?;
-    Ok(port)
+    Ok(ssh_port)
 }
 
 /// Scan `/proc` for *any* qemu process running this box, independent of our
@@ -125,7 +125,7 @@ pub fn status(paths: &BoxPaths) -> Result<Status> {
         return Ok(Status { running: false, pid: None, ssh_port: None });
     };
     if !pid_alive(pid) {
-        // Stale pidfile from a crashed/killed qemu; clean it up.
+        // Stale pidfile from a crashed/killed qemu; clean up the leftover state.
         std::fs::remove_file(&paths.pid_file).ok();
         std::fs::remove_file(&paths.ssh_port_file).ok();
         return Ok(Status { running: false, pid: None, ssh_port: None });
@@ -163,6 +163,23 @@ pub fn stop(paths: &BoxPaths, timeout: Duration) -> Result<()> {
     signal(pid, libc::SIGKILL);
     cleanup_runtime(paths);
     Ok(())
+}
+
+/// Configure QEMU networking and return the host port that reaches guest SSH.
+///
+/// Wires QEMU's guest NIC to slirp user-mode networking, forwarding a free host
+/// port to guest :22 so Potjie can always SSH in. Any other guest ports the user
+/// wants on the host are tunnelled per-box over SSH `LocalForward` (configured in
+/// the GUI), not at the QEMU layer — that keeps port exposure explicit and
+/// user-controlled instead of opening the whole guest to the host.
+fn wire_network(cmd: &mut Command, _paths: &BoxPaths) -> Result<u16> {
+    let ssh_port = free_port()?;
+    cmd.args([
+        "-netdev",
+        &format!("user,id=net0,hostfwd=tcp:127.0.0.1:{ssh_port}-:22"),
+    ])
+    .args(["-device", "virtio-net-pci,netdev=net0"]);
+    Ok(ssh_port)
 }
 
 fn cleanup_runtime(paths: &BoxPaths) {
