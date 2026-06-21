@@ -1,29 +1,48 @@
-//! Discovering apps and generating host wrapper launchers.
+//! Discovering box apps and generating wrapper launchers.
 //!
 //! A wrapper `.desktop` is a *lifecycle binding*: launching it boots the box,
-//! runs an app for as long as that app lives, then stops (re-locks) the box.
-//! Two kinds:
+//! runs an app *inside* the box (shown on the host via X-forwarded SSH) for as
+//! long as that app lives, then stops (re-locks) the box.
 //!
-//!   * [`Kind::Vm`]   — the app lives *inside* the box and is shown on the host
-//!     via X-forwarded SSH.
-//!   * [`Kind::Host`] — a *native host* app runs on the host while the box is up,
-//!     and talks into the box over local SSH (e.g. host VS Code + Remote-SSH to
-//!     the `potjie-<box>` alias). Native UI, but all your code/tools stay sealed
-//!     in the encrypted box.
-//!
-//! For the host case to "just work", [`sync_ssh_config`] keeps a stable
-//! `potjie-<box>` SSH alias pointing at the box's current forwarded port.
+//! [`sync_ssh_config`] keeps a stable `potjie-<box>` SSH alias pointing at the
+//! box's current forwarded port, so `ssh potjie-<box>` and the per-box port
+//! forwards always resolve while the box is up.
 
 use crate::boxes::Vm;
 use crate::paths;
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
+use ashpd::desktop::dynamic_launcher::{
+    DynamicLauncherProxy, InstallOptions, LauncherType, PrepareInstallOptions,
+};
+use ashpd::desktop::Icon;
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
-/// Where a wrapped app runs.
+/// Our Flatpak app id. The DynamicLauncher portal requires every launcher we
+/// install to be prefixed with it, so we can never name (or clobber) a launcher
+/// belonging to another app.
+const APP_ID: &str = "com.potjie.Potjie";
+
+/// Launcher icon, embedded so we always have icon *bytes* to hand the portal
+/// (PrepareInstall rejects themed-name icons — it wants raw image bytes).
+const ICON_PNG: &[u8] = include_bytes!("../../../icons/potjie-128.png");
+
+/// Drive a portal future to completion on a throwaway current-thread runtime.
+/// Launcher create/remove are rare, user-initiated actions, so spinning a
+/// short-lived runtime per call is fine and keeps the rest of the crate sync.
+fn block_on<F: std::future::Future>(fut: F) -> Result<F::Output> {
+    Ok(tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("building tokio runtime for portal call")?
+        .block_on(fut))
+}
+
+/// Where a wrapped app runs. Currently always inside the box (guest); the enum
+/// is kept so the launcher arg format (`--launch <box> <kind> <app>`) stays
+/// stable for already-installed launchers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
-    /// Native host application.
-    Host,
     /// Application inside the box (guest).
     Vm,
 }
@@ -31,14 +50,12 @@ pub enum Kind {
 impl Kind {
     pub fn as_str(self) -> &'static str {
         match self {
-            Kind::Host => "host",
             Kind::Vm => "vm",
         }
     }
 
     pub fn parse(s: &str) -> Option<Self> {
         match s {
-            "host" => Some(Kind::Host),
             "vm" => Some(Kind::Vm),
             _ => None,
         }
@@ -89,110 +106,6 @@ impl Vm {
     }
 }
 
-/// Standard host directories that hold `.desktop` files.
-fn host_app_dirs() -> Vec<PathBuf> {
-    let mut dirs = vec![
-        PathBuf::from("/usr/share/applications"),
-        PathBuf::from("/usr/local/share/applications"),
-        PathBuf::from("/var/lib/flatpak/exports/share/applications"),
-    ];
-    if let Some(data) = dirs::data_dir() {
-        dirs.push(data.join("applications"));
-        dirs.push(data.join("flatpak/exports/share/applications"));
-    }
-    dirs
-}
-
-/// List GUI apps installed on the host (excluding Potjie's own wrappers).
-pub fn list_host_apps() -> Result<Vec<DesktopEntry>> {
-    let mut entries = Vec::new();
-    for dir in host_app_dirs() {
-        let Ok(rd) = std::fs::read_dir(&dir) else { continue };
-        for e in rd.flatten() {
-            let path = e.path();
-            if path.extension().and_then(|s| s.to_str()) != Some("desktop") {
-                continue;
-            }
-            let id = path.file_stem().and_then(|s| s.to_str()).unwrap_or("").to_string();
-            // Don't offer our own generated wrappers as wrappable apps.
-            if id.is_empty() || id.starts_with("potjie-") {
-                continue;
-            }
-            if let Some(entry) = parse_desktop_file(&path, &id) {
-                entries.push(entry);
-            }
-        }
-    }
-    finish(entries)
-}
-
-/// Resolve a host app's `Exec`, with `.desktop` field codes (`%U`, `%f`, …)
-/// stripped so it can be run directly.
-pub fn resolve_host_exec(id: &str) -> Option<String> {
-    for dir in host_app_dirs() {
-        let path = dir.join(format!("{id}.desktop"));
-        if let Some(entry) = parse_desktop_file(&path, id) {
-            return Some(strip_field_codes(&entry.exec));
-        }
-    }
-    None
-}
-
-/// Parse the `[Desktop Entry]` group of a `.desktop` file. Returns `None` for
-/// hidden / non-application entries.
-fn parse_desktop_file(path: &Path, id: &str) -> Option<DesktopEntry> {
-    let text = std::fs::read_to_string(path).ok()?;
-    let mut in_main = false;
-    let (mut name, mut exec, mut typ) = (None, None, None);
-    let mut no_display = false;
-    for line in text.lines() {
-        let line = line.trim();
-        if line.starts_with('[') {
-            in_main = line == "[Desktop Entry]";
-            continue;
-        }
-        if !in_main {
-            continue;
-        }
-        if let Some(v) = line.strip_prefix("Name=") {
-            name.get_or_insert_with(|| v.to_string());
-        } else if let Some(v) = line.strip_prefix("Exec=") {
-            exec.get_or_insert_with(|| v.to_string());
-        } else if let Some(v) = line.strip_prefix("Type=") {
-            typ.get_or_insert_with(|| v.to_string());
-        } else if line == "NoDisplay=true" || line == "Hidden=true" {
-            no_display = true;
-        }
-    }
-    if no_display || typ.as_deref() != Some("Application") {
-        return None;
-    }
-    Some(DesktopEntry {
-        id: id.to_string(),
-        name: name.unwrap_or_else(|| id.to_string()),
-        exec: exec.unwrap_or_default(),
-    })
-}
-
-fn strip_field_codes(exec: &str) -> String {
-    // Remove %f %F %u %U %i %c %k etc. (single-letter field codes).
-    let mut out = String::with_capacity(exec.len());
-    let mut chars = exec.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c == '%' {
-            if let Some(&n) = chars.peek() {
-                if n == '%' {
-                    out.push('%');
-                }
-                chars.next();
-            }
-        } else {
-            out.push(c);
-        }
-    }
-    out.trim().to_string()
-}
-
 /// Sort, dedup, and case-insensitively order a list of entries.
 fn finish(mut entries: Vec<DesktopEntry>) -> Result<Vec<DesktopEntry>> {
     entries.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
@@ -200,33 +113,89 @@ fn finish(mut entries: Vec<DesktopEntry>) -> Result<Vec<DesktopEntry>> {
     Ok(entries)
 }
 
-/// The host applications directory (`~/.local/share/applications`).
-pub fn applications_dir() -> Result<PathBuf> {
-    let data = dirs::data_dir().context("could not determine data dir")?;
-    Ok(data.join("applications"))
+fn sanitize(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect()
 }
 
-/// Write a host wrapper `.desktop` for `entry` in `box_name`, of the given
-/// `kind`, displayed as `display_name`. `launcher` is the absolute path to the
-/// binary that performs the boot/run/stop flow (the running `potjie-gtk`).
+/// The portal `desktop_file_id` for a launcher. Deterministic, so re-creating a
+/// launcher for the same app simply replaces it. Must start with [`APP_ID`].
+fn file_id(box_name: &str, kind: Kind, app_id: &str) -> String {
+    format!(
+        "{APP_ID}.{}-{}-{}.desktop",
+        sanitize(box_name),
+        kind.as_str(),
+        sanitize(app_id)
+    )
+}
+
+// ---- launcher registry ---------------------------------------------------
+//
+// The DynamicLauncher portal installs/uninstalls launchers but has no API to
+// *enumerate* the ones we created — and we no longer have filesystem access to
+// scan `~/.local/share/applications`. So we keep our own small registry in
+// Potjie's data dir and self-heal it against the portal (`GetDesktopEntry`) so a
+// launcher the user removed by other means doesn't linger in our list.
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Record {
+    file_id: String,
+    box_name: String,
+    kind: String,
+    app_id: String,
+    name: String,
+}
+
+fn registry_path() -> Result<PathBuf> {
+    Ok(paths::root()?.join("launchers.json"))
+}
+
+fn load_registry() -> Vec<Record> {
+    registry_path()
+        .ok()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+fn save_registry(recs: &[Record]) -> Result<()> {
+    let p = registry_path()?;
+    if let Some(parent) = p.parent() {
+        paths::create_private_dir(parent)?;
+    }
+    let json = serde_json::to_string_pretty(recs).context("serializing launcher registry")?;
+    std::fs::write(&p, json).with_context(|| format!("writing {}", p.display()))
+}
+
+/// A launcher Potjie installed via the DynamicLauncher portal.
+#[derive(Debug, Clone)]
+pub struct Wrapper {
+    /// The portal `desktop_file_id` (used to uninstall it).
+    pub file_id: String,
+    pub name: String,
+    pub box_name: String,
+    pub kind: Kind,
+    pub app_id: String,
+}
+
+/// Install a launcher for `entry` in `box_name` via the DynamicLauncher portal.
+/// Shows the portal's one-time install dialog; `launcher` is the absolute path to
+/// the binary that performs the boot/run/stop flow (the running `potjie-gtk`).
+///
+/// NB: this blocks on the portal dialog, so callers must run it off the UI thread.
 pub fn create_wrapper(
     box_name: &str,
     kind: Kind,
     entry: &DesktopEntry,
     display_name: &str,
     launcher: &Path,
-) -> Result<PathBuf> {
-    let dir = applications_dir()?;
-    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
-
-    let file_id = format!("potjie-{}-{}-{}", box_name, kind.as_str(), sanitize(&entry.id));
-    let path = dir.join(format!("{file_id}.desktop"));
-
-    let where_ = match kind {
-        Kind::Host => "on the host, connected into",
-        Kind::Vm => "inside",
-    };
-    let contents = format!(
+) -> Result<()> {
+    let id = file_id(box_name, kind, &entry.id);
+    let where_ = "inside";
+    // The portal rewrites/validates Exec (and adds Icon=); we keep our X-Potjie-*
+    // markers, which it preserves verbatim.
+    let desktop_entry = format!(
         "[Desktop Entry]\n\
 Type=Application\n\
 Name={display}\n\
@@ -242,83 +211,114 @@ X-Potjie-App={app_id}\n",
         kind = kind.as_str(),
         app_id = entry.id,
     );
-    std::fs::write(&path, contents).with_context(|| format!("writing {}", path.display()))?;
-    Ok(path)
+
+    block_on(async {
+        let proxy = DynamicLauncherProxy::new().await?;
+        let opts = PrepareInstallOptions::default()
+            .set_launcher_type(LauncherType::Application)
+            .set_editable_name(false)
+            .set_editable_icon(false);
+        let token = proxy
+            .prepare_install(None, display_name, Icon::Bytes(ICON_PNG.to_vec()), opts)
+            .await?
+            .response()?
+            .token()
+            .to_owned();
+        proxy
+            .install(&token, &id, &desktop_entry, InstallOptions::default())
+            .await
+    })?
+    .map_err(|e| anyhow!("portal install failed: {e}"))?;
+
+    let mut recs = load_registry();
+    recs.retain(|r| r.file_id != id);
+    recs.push(Record {
+        file_id: id,
+        box_name: box_name.to_string(),
+        kind: kind.as_str().to_string(),
+        app_id: entry.id.clone(),
+        name: display_name.to_string(),
+    });
+    save_registry(&recs)
 }
 
-fn sanitize(s: &str) -> String {
-    s.chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
-        .collect()
-}
-
-/// A launcher `.desktop` Potjie generated for a box.
-#[derive(Debug, Clone)]
-pub struct Wrapper {
-    pub path: PathBuf,
-    pub name: String,
-    pub box_name: String,
-    pub kind: Kind,
-    pub app_id: String,
-}
-
-/// List the launchers Potjie generated, optionally filtered to one box. Ours are
-/// identified by the `X-Potjie-Box` key we stamp into every generated file (so we
-/// never touch unrelated `.desktop` files).
+/// List the launchers Potjie installed, optionally filtered to one box. Reads our
+/// registry only (no D-Bus), so it's cheap and safe to call from the UI thread;
+/// stale entries are pruned lazily on removal and by [`prune_wrappers`].
 pub fn list_wrappers(box_name: Option<&str>) -> Result<Vec<Wrapper>> {
-    let dir = applications_dir()?;
-    let mut out = Vec::new();
-    let Ok(entries) = std::fs::read_dir(&dir) else {
-        return Ok(out); // no apps dir yet → no wrappers
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("desktop") {
-            continue;
-        }
-        let Ok(text) = std::fs::read_to_string(&path) else { continue };
-        let (mut bx, mut kind, mut app, mut name) = (None, None, None, None);
-        for line in text.lines() {
-            if let Some(v) = line.strip_prefix("X-Potjie-Box=") {
-                bx = Some(v.trim().to_string());
-            } else if let Some(v) = line.strip_prefix("X-Potjie-Kind=") {
-                kind = Kind::parse(v.trim());
-            } else if let Some(v) = line.strip_prefix("X-Potjie-App=") {
-                app = Some(v.trim().to_string());
-            } else if name.is_none() {
-                if let Some(v) = line.strip_prefix("Name=") {
-                    name = Some(v.trim().to_string());
-                }
-            }
-        }
-        // Skip anything missing our markers (i.e. not a Potjie launcher).
-        let (Some(bx), Some(kind), Some(app)) = (bx, kind, app) else { continue };
-        if box_name.is_some_and(|filter| filter != bx) {
-            continue;
-        }
-        out.push(Wrapper {
-            name: name.unwrap_or_else(|| app.clone()),
-            path,
-            box_name: bx,
-            kind,
-            app_id: app,
-        });
-    }
-    out.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    let mut out: Vec<Wrapper> = load_registry()
+        .into_iter()
+        .filter(|r| box_name.is_none_or(|b| b == r.box_name))
+        .map(|r| Wrapper {
+            file_id: r.file_id,
+            name: r.name,
+            box_name: r.box_name,
+            kind: Kind::parse(&r.kind).unwrap_or(Kind::Vm),
+            app_id: r.app_id,
+        })
+        .collect();
+    out.sort_by_key(|w| w.name.to_lowercase());
     Ok(out)
 }
 
-/// Delete one generated launcher.
-pub fn remove_wrapper(path: &Path) -> Result<()> {
-    std::fs::remove_file(path).with_context(|| format!("removing launcher {}", path.display()))
+/// Drop registry entries whose launcher the portal no longer knows about (e.g.
+/// the user deleted it through their desktop's settings). Does one
+/// `GetDesktopEntry` per record, so callers should run it off the UI thread.
+pub fn prune_wrappers() -> Result<()> {
+    let recs = load_registry();
+    if recs.is_empty() {
+        return Ok(());
+    }
+    let live = block_on(async {
+        let Ok(proxy) = DynamicLauncherProxy::new().await else {
+            return recs.clone(); // portal unavailable: trust the registry
+        };
+        let mut live = Vec::new();
+        for r in &recs {
+            if proxy.desktop_entry(&r.file_id).await.is_ok() {
+                live.push(r.clone());
+            }
+        }
+        live
+    })?;
+    if live.len() != recs.len() {
+        save_registry(&live)?;
+    }
+    Ok(())
 }
 
-/// Delete every launcher generated for `box_name` (they go stale when the box is
-/// deleted). Returns how many were removed.
+/// Uninstall one launcher via the portal and drop it from the registry. The
+/// uninstall is best-effort (a launcher already gone elsewhere still leaves us in
+/// the desired end state), so this only errors if the portal itself is
+/// unreachable. Run off the UI thread.
+pub fn remove_wrapper(file_id: &str) -> Result<()> {
+    block_on(async {
+        let proxy = DynamicLauncherProxy::new().await?;
+        let _ = proxy.uninstall(file_id, Default::default()).await; // best-effort
+        Ok::<(), ashpd::Error>(())
+    })?
+    .map_err(|e| anyhow!("portal unreachable: {e}"))?;
+
+    let mut recs = load_registry();
+    let before = recs.len();
+    recs.retain(|r| r.file_id != file_id);
+    if recs.len() != before {
+        save_registry(&recs)?;
+    }
+    Ok(())
+}
+
+/// Uninstall every launcher for `box_name` (they go stale when the box is
+/// deleted). Returns how many were removed. Run off the UI thread.
 pub fn remove_wrappers_for_box(box_name: &str) -> Result<usize> {
+    let mine: Vec<String> = load_registry()
+        .into_iter()
+        .filter(|r| r.box_name == box_name)
+        .map(|r| r.file_id)
+        .collect();
     let mut n = 0;
-    for w in list_wrappers(Some(box_name))? {
-        if remove_wrapper(&w.path).is_ok() {
+    for id in &mine {
+        if remove_wrapper(id).is_ok() {
             n += 1;
         }
     }
@@ -379,26 +379,76 @@ pub fn sync_ssh_config() -> Result<()> {
         }
     }
     write_private(&frag, body.as_bytes())?;
-    ensure_ssh_include(&frag)?;
+    // NB: we deliberately do *not* touch `~/.ssh/config` here. Potjie holds only
+    // read-only access to it (least privilege — the user's SSH config can carry
+    // ProxyCommand/IdentityFile and is too sensitive to grant write access to).
+    // Adding the one-time `Include` line is the user's call; the GUI gates on
+    // [`ssh_include_status`] and walks them through it.
     Ok(())
 }
 
-/// Ensure `~/.ssh/config` has an `Include` of our fragment (prepended once).
-fn ensure_ssh_include(frag: &Path) -> Result<()> {
-    let home = dirs::home_dir().context("no home directory")?;
-    let ssh_dir = home.join(".ssh");
-    paths::create_private_dir(&ssh_dir)?;
-    let cfg = ssh_dir.join("config");
-    let include = format!("Include {}", frag.display());
+/// Path to the user's `~/.ssh/config` — where the one-time `Include` of our
+/// managed fragment belongs.
+pub fn user_ssh_config_path() -> Result<PathBuf> {
+    Ok(dirs::home_dir().context("no home directory")?.join(".ssh").join("config"))
+}
 
-    let existing = std::fs::read_to_string(&cfg).unwrap_or_default();
-    if existing.lines().any(|l| l.trim() == include) {
-        return Ok(());
+/// The exact line the user must add to `~/.ssh/config` so host tools (terminal
+/// `ssh`, VS Code Remote-SSH, …) resolve the `potjie-<box>` aliases.
+pub fn ssh_include_line() -> Result<String> {
+    Ok(format!("Include {}", ssh_config_path()?.display()))
+}
+
+/// Whether the user has opted out of host SSH integration. Stored as a marker
+/// file in Potjie's own (writable) data dir, so the GUI gate stays dismissed.
+fn ssh_include_optout_path() -> Result<PathBuf> {
+    Ok(paths::root()?.join("skip-ssh-include"))
+}
+
+/// Record (or clear) the user's choice to skip the `~/.ssh/config` Include.
+pub fn set_ssh_include_optout(skip: bool) -> Result<()> {
+    let marker = ssh_include_optout_path()?;
+    if skip {
+        if let Some(parent) = marker.parent() {
+            paths::create_private_dir(parent)?;
+        }
+        std::fs::write(&marker, b"").with_context(|| format!("writing {}", marker.display()))?;
+    } else if marker.exists() {
+        std::fs::remove_file(&marker).with_context(|| format!("removing {}", marker.display()))?;
     }
-    // OpenSSH applies the first matching value, so put the Include at the top.
-    let new = format!("{include}\n\n{existing}");
-    write_private(&cfg, new.as_bytes())?;
     Ok(())
+}
+
+/// State of the host-side SSH integration, from a read-only look at the user's
+/// `~/.ssh/config` plus our opt-out marker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IncludeStatus {
+    /// The `Include` line is present — host aliases resolve.
+    Present,
+    /// Missing, but the user explicitly opted out; proceed without nagging.
+    OptedOut,
+    /// Missing and not opted out — host aliases won't resolve until added.
+    Missing,
+}
+
+/// Read-only check of whether `~/.ssh/config` includes our fragment. Never
+/// writes (Potjie only holds `~/.ssh/config:ro`).
+pub fn ssh_include_status() -> IncludeStatus {
+    let present = (|| {
+        let line = ssh_include_line().ok()?;
+        let cfg = user_ssh_config_path().ok()?;
+        let text = std::fs::read_to_string(&cfg).ok()?;
+        Some(text.lines().any(|l| l.trim() == line))
+    })()
+    .unwrap_or(false);
+
+    if present {
+        IncludeStatus::Present
+    } else if ssh_include_optout_path().map(|p| p.exists()).unwrap_or(false) {
+        IncludeStatus::OptedOut
+    } else {
+        IncludeStatus::Missing
+    }
 }
 
 #[cfg(unix)]

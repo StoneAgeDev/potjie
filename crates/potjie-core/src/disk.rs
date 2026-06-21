@@ -82,7 +82,7 @@ pub fn secret_id() -> &'static str {
 /// report whether its payload is LUKS-encrypted. Used as one half of the
 /// decryption assurance: the disk is provably encrypted at rest.
 pub fn is_luks_encrypted(disk: &Path) -> Result<bool> {
-    let out = std::process::Command::new(qemu_img())
+    let out = Command::new(qemu_img())
         // -U (force-share) so we can read metadata even while a running qemu
         // holds the image lock.
         .args(["info", "-U", "--output=json"])

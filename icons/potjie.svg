@@ -1,0 +1,56 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <defs>
+    <linearGradient id="tile" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#f2ede4"></stop>
+      <stop offset="100%" stop-color="#e3dccd"></stop>
+    </linearGradient>
+    <radialGradient id="tileglow" cx="50%" cy="58%" r="55%">
+      <stop offset="0%" stop-color="#ffffff" stop-opacity="0.5"></stop>
+      <stop offset="100%" stop-color="#ffffff" stop-opacity="0"></stop>
+    </radialGradient>
+    <clipPath id="bc2"><path d="M19 18 C11 20 9 30 10 37 C11 48 20 56 32 56 C44 56 53 48 54 37 C55 30 53 20 45 18 Z"></path></clipPath>
+    <radialGradient id="spill" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#ffd98a" stop-opacity="0.55"></stop>
+      <stop offset="22%" stop-color="#f5b25a" stop-opacity="0.36"></stop>
+      <stop offset="48%" stop-color="#e08c34" stop-opacity="0.16"></stop>
+      <stop offset="74%" stop-color="#d2731a" stop-opacity="0.045"></stop>
+      <stop offset="100%" stop-color="#d2731a" stop-opacity="0"></stop>
+    </radialGradient>
+    <radialGradient id="core" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#fff2cf" stop-opacity="0.95"></stop>
+      <stop offset="40%" stop-color="#ffce79" stop-opacity="0.5"></stop>
+      <stop offset="100%" stop-color="#ffce79" stop-opacity="0"></stop>
+    </radialGradient>
+    <linearGradient id="hot" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#fff7dc"></stop>
+      <stop offset="45%" stop-color="#ffd27e"></stop>
+      <stop offset="100%" stop-color="#f0a038"></stop>
+    </linearGradient>
+  </defs>
+
+  <rect x="0" y="0" width="1024" height="1024" rx="230" ry="230" fill="url(#tile)"></rect>
+  <rect x="0" y="0" width="1024" height="1024" rx="230" ry="230" fill="url(#tileglow)"></rect>
+
+  <g transform="translate(217.6,178) scale(9.2)">
+    <ellipse cx="32" cy="62.6" rx="15.5" ry="2.6" fill="#000" opacity="0.16"></ellipse>
+    <path d="M29.6 49 L34.4 49 L33.3 60.5 L30.7 60.5 Z" fill="#1b1916"></path>
+    <path d="M19 18 C11 20 9 30 10 37 C11 48 20 56 32 56 C44 56 53 48 54 37 C55 30 53 20 45 18 Z" fill="#33302c"></path>
+    <g clip-path="url(#bc2)">
+      <ellipse cx="45" cy="47" rx="23" ry="23" fill="#141210" opacity="0.55"></ellipse>
+      <ellipse cx="22" cy="29" rx="9" ry="12" fill="#6b6862" opacity="0.85"></ellipse>
+      <ellipse cx="32" cy="40" rx="21" ry="22" fill="url(#spill)"></ellipse>
+      <ellipse cx="32" cy="38" rx="10.5" ry="12" fill="url(#core)"></ellipse>
+    </g>
+    <circle cx="32" cy="37" r="4.3" fill="url(#hot)"></circle>
+    <path d="M29.7 39 L28.1 47.5 L35.9 47.5 L34.3 39 Z" fill="url(#hot)"></path>
+    <g fill="none" stroke="#ffeec0" stroke-width="0.7" opacity="0.85">
+      <circle cx="32" cy="37" r="4.3"></circle>
+      <path d="M29.7 39 L28.1 47.5 L35.9 47.5 L34.3 39"></path>
+    </g>
+    <path d="M21 54 L26.2 54 L23 62.2 L17.8 62.2 Z" fill="#26231f"></path>
+    <path d="M37.8 54 L43 54 L46.2 62.2 L41 62.2 Z" fill="#26231f"></path>
+    <ellipse cx="32" cy="18" rx="13" ry="4.6" fill="#33302c"></ellipse>
+    <ellipse cx="32" cy="18.3" rx="9" ry="2.9" fill="#100f0d"></ellipse>
+    <path d="M23 17 a9 2.9 0 0 1 18 0" fill="none" stroke="#6b6862" stroke-width="1.2" opacity="0.7"></path>
+  </g>
+</svg>

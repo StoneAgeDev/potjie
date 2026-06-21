@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>com.potjie.Potjie</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+
+  <name>Potjie</name>
+  <summary>Encrypted virtual machine manager</summary>
+
+  <developer id="com.potjie">
+    <name>Potjie contributors</name>
+  </developer>
+
+  <description>
+    <p>
+      Potjie manages secure, encrypted, user-space virtual machines ("boxes").
+      Each box is a LUKS-encrypted disk that QEMU decrypts only while you are
+      actively using it. When you are done, the box is re-locked automatically
+      — your data is sealed and encrypted until you open it again.
+    </p>
+    <p>Features:</p>
+    <ul>
+      <li>LUKS-encrypted QEMU virtual machines — no root required</li>
+      <li>User-space networking via slirp (no TAP devices or bridging)</li>
+      <li>Implicit lifecycle: the box runs only while the Shell tab is open</li>
+      <li>SSH port forwards (host ↔ box) configured live in the GUI</li>
+      <li>Generate desktop launchers that keep a box alive for one app</li>
+      <li>Desktop notifications on every box start and stop</li>
+    </ul>
+  </description>
+
+  <launchable type="desktop-id">com.potjie.Potjie.desktop</launchable>
+
+  <url type="homepage">https://github.com/potjie/potjie</url>
+  <url type="bugtracker">https://github.com/potjie/potjie/issues</url>
+
+  <releases>
+    <release version="0.1.0" date="2026-06-20">
+      <description>
+        <p>Initial release. Full LUKS VM lifecycle, SSH port forwards, and
+           an embedded terminal shell tab.</p>
+      </description>
+    </release>
+  </releases>
+
+  <content_rating type="oars-1.1" />
+
+  <provides>
+    <binary>potjie-gtk</binary>
+    <binary>potjie</binary>
+  </provides>
+</component>

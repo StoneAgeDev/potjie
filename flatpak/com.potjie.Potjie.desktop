@@ -1,7 +1,10 @@
 [Desktop Entry]
 Name=Potjie
 Comment=Encrypted virtual machine manager
-Exec=potjie-wrapper
+Exec=potjie-gtk
 Icon=com.potjie.Potjie
 Type=Application
 Categories=System;Emulator;
+Keywords=virtual machine;VM;encrypted;LUKS;developer;sandbox;
+StartupWMClass=com.potjie.Potjie
+X-GNOME-UsesNotifications=true

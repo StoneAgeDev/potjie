@@ -319,7 +319,17 @@ pub fn build_main_window(app: &adw::Application) {
     let overlay = gtk::Overlay::new();
     overlay.set_child(Some(&split));
     overlay.add_overlay(&confirm_banner);
-    window.set_child(Some(&overlay));
+
+    // Host SSH integration gate: if the user's `~/.ssh/config` doesn't yet
+    // Include our managed fragment (and they haven't opted out), show an inline
+    // setup screen instead of the main UI. Potjie only holds *read-only* access
+    // to `~/.ssh/config` — we never edit it for them; they add one line.
+    use potjie_core::desktop::IncludeStatus;
+    if potjie_core::desktop::ssh_include_status() == IncludeStatus::Missing {
+        window.set_child(Some(&build_ssh_gate(&window, &overlay)));
+    } else {
+        window.set_child(Some(&overlay));
+    }
 
     // Window-level key capture: answer the confirmation with y / n / Esc from
     // anywhere, so you never have to click.
@@ -534,6 +544,139 @@ pub fn build_main_window(app: &adw::Application) {
     start_sidebar_poller(&sidebar);
 
     window.present();
+}
+
+/// Inline setup screen shown when `~/.ssh/config` doesn't yet Include Potjie's
+/// managed SSH fragment. Potjie only has *read-only* access to that file, so we
+/// can't (and won't) edit it — the user pastes one line. Resolving the gate (or
+/// the deliberately-buried skip) swaps the real UI (`overlay`) into the window.
+fn build_ssh_gate(window: &ApplicationWindow, overlay: &gtk::Overlay) -> GtkBox {
+    let line = potjie_core::desktop::ssh_include_line().unwrap_or_default();
+    let cfg = potjie_core::desktop::user_ssh_config_path()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "~/.ssh/config".into());
+
+    let outer = GtkBox::new(Orientation::Vertical, 14);
+    outer.set_halign(Align::Center);
+    outer.set_valign(Align::Center);
+    outer.set_margin_top(32);
+    outer.set_margin_bottom(32);
+    outer.set_margin_start(32);
+    outer.set_margin_end(32);
+    outer.set_width_request(560);
+
+    let title = Label::new(Some("One-time setup: let host tools reach your boxes"));
+    title.add_css_class("title-2");
+    title.set_halign(Align::Start);
+    title.set_wrap(true);
+
+    let body = Label::new(Some(
+        "So terminal \u{2018}ssh\u{2019} and VS Code Remote-SSH can reach a box by a \
+         stable name (\u{2018}potjie-<box>\u{2019}), one line needs to go at the top of \
+         your SSH config. Potjie only has read-only access to that file and will \
+         never edit it for you \u{2014} add the line yourself, then continue:",
+    ));
+    body.set_halign(Align::Start);
+    body.set_wrap(true);
+    body.set_xalign(0.0);
+
+    // The line to paste, in a selectable monospace row with a Copy button.
+    let line_row = GtkBox::new(Orientation::Horizontal, 8);
+    line_row.set_halign(Align::Start);
+    let line_label = Label::new(Some(&line));
+    line_label.add_css_class("monospace");
+    line_label.set_selectable(true);
+    line_label.set_halign(Align::Start);
+    line_label.set_wrap(true);
+    line_label.set_xalign(0.0);
+    let copy_btn = Button::from_icon_name("edit-copy-symbolic");
+    copy_btn.set_tooltip_text(Some("Copy"));
+    copy_btn.set_valign(Align::Center);
+    line_row.append(&line_label);
+    line_row.append(&copy_btn);
+
+    let where_ = Label::new(Some(&format!("Add it to:  {cfg}")));
+    where_.add_css_class("dim-label");
+    where_.set_halign(Align::Start);
+    where_.set_wrap(true);
+    where_.set_xalign(0.0);
+
+    let status = Label::new(None);
+    status.add_css_class("error");
+    status.set_halign(Align::Start);
+    status.set_wrap(true);
+    status.set_xalign(0.0);
+
+    let continue_btn = Button::with_label("I've added it \u{2014} continue");
+    continue_btn.add_css_class("suggested-action");
+    continue_btn.set_halign(Align::Start);
+
+    // Deliberately buried escape hatch: skip touching the SSH config entirely.
+    let skip_exp = Expander::new(Some("Potjie not working for you?"));
+    let skip_box = GtkBox::new(Orientation::Vertical, 8);
+    skip_box.set_margin_top(8);
+    skip_box.set_margin_start(8);
+    let skip_warn = Label::new(Some(
+        "You can skip this, but Potjie is half-broken without it: host tools \
+         won't resolve \u{2018}potjie-<box>\u{2019}, so VS Code Remote-SSH and \
+         \u{2018}ssh potjie-…\u{2019} won't work. Boxes and the built-in Shell tab \
+         still run. You can re-enable this any time by adding the line above.",
+    ));
+    skip_warn.set_wrap(true);
+    skip_warn.set_xalign(0.0);
+    skip_warn.add_css_class("dim-label");
+    let skip_btn = Button::with_label("Skip \u{2014} leave my SSH config alone");
+    skip_btn.add_css_class("destructive-action");
+    skip_btn.set_halign(Align::Start);
+    skip_box.append(&skip_warn);
+    skip_box.append(&skip_btn);
+    skip_exp.set_child(Some(&skip_box));
+
+    outer.append(&title);
+    outer.append(&body);
+    outer.append(&line_row);
+    outer.append(&where_);
+    outer.append(&status);
+    outer.append(&continue_btn);
+    outer.append(&skip_exp);
+
+    // Reveal the real UI by swapping the window's child.
+    let reveal: Rc<dyn Fn()> = {
+        let window = window.clone();
+        let overlay = overlay.clone();
+        Rc::new(move || window.set_child(Some(&overlay)))
+    };
+
+    copy_btn.connect_clicked(clone!(
+        #[strong] line,
+        move |btn| btn.clipboard().set_text(&line)
+    ));
+
+    continue_btn.connect_clicked(clone!(
+        #[strong] reveal, #[strong] status,
+        move |_| {
+            use potjie_core::desktop::IncludeStatus;
+            if potjie_core::desktop::ssh_include_status() == IncludeStatus::Missing {
+                status.set_text(
+                    "Still not found in your SSH config. Make sure you saved the file \
+                     with the exact line above. (If you just created ~/.ssh/config, \
+                     restart Potjie so it can see the new file.)",
+                );
+            } else {
+                reveal();
+            }
+        }
+    ));
+
+    skip_btn.connect_clicked(clone!(
+        #[strong] reveal,
+        move |_| {
+            let _ = potjie_core::desktop::set_ssh_include_optout(true);
+            reveal();
+        }
+    ));
+
+    outer
 }
 
 /// Poll box running-state once a second and live-update each sidebar status dot
@@ -999,9 +1142,8 @@ fn apps_tab(window: &ApplicationWindow, vm: Rc<Vm>) -> GtkBox {
 
     let hint = Label::new(Some(
         "Create a launcher that runs an app while this box is up, then re-locks \
-         the box when the app exits. Host apps run natively on the host and \
-         connect into the box over local SSH (alias 'potjie-<box>'); box apps run \
-         inside the box and display on the host. Lists scan when expanded.",
+         the box when the app exits. Box apps run inside the box and display on \
+         the host over local SSH. The list scans when expanded.",
     ));
     hint.set_wrap(true);
     hint.set_halign(Align::Start);
@@ -1011,11 +1153,13 @@ fn apps_tab(window: &ApplicationWindow, vm: Rc<Vm>) -> GtkBox {
     let (wrappers_box, refresh_wrappers) = wrappers_section(vm.clone());
     page.append(&wrappers_box);
 
-    page.append(&app_section(
-        window, vm.clone(), Kind::Host,
-        "Host applications  —  run on the host, connected into the box",
-        refresh_wrappers.clone(),
-    ));
+    // Self-heal the registry in the background (drop launchers the user removed
+    // via their desktop), then re-render the list.
+    run_async(
+        || { let _ = potjie_core::desktop::prune_wrappers(); },
+        clone!(#[strong] refresh_wrappers, move |_: ()| refresh_wrappers()),
+    );
+
     page.append(&app_section(
         window, vm, Kind::Vm,
         "Box applications  —  run inside the box, shown on the host",
@@ -1058,11 +1202,7 @@ fn wrappers_section(vm: Rc<Vm>) -> (GtkBox, Rc<dyn Fn()>) {
                 rowbox.set_margin_bottom(6);
                 rowbox.set_margin_start(10);
                 rowbox.set_margin_end(10);
-                let tag = match w.kind {
-                    Kind::Host => "host",
-                    Kind::Vm => "box",
-                };
-                let name = Label::new(Some(&format!("{}  ({tag})", w.name)));
+                let name = Label::new(Some(&w.name));
                 name.set_halign(Align::Start);
                 name.set_hexpand(true);
                 let remove = Button::from_icon_name("user-trash-symbolic");
@@ -1073,13 +1213,21 @@ fn wrappers_section(vm: Rc<Vm>) -> (GtkBox, Rc<dyn Fn()>) {
                 let row = gtk::ListBoxRow::new();
                 row.set_selectable(false);
                 row.set_child(Some(&rowbox));
-                let path = w.path.clone();
+                let file_id = w.file_id.clone();
                 remove.connect_clicked(clone!(
-                    #[weak] list, #[weak] row,
-                    move |_| {
-                        if potjie_core::desktop::remove_wrapper(&path).is_ok() {
-                            list.remove(&row);
-                        }
+                    #[strong] list, #[strong] row,
+                    move |btn| {
+                        btn.set_sensitive(false);
+                        let file_id = file_id.clone();
+                        run_async(
+                            move || potjie_core::desktop::remove_wrapper(&file_id)
+                                .map_err(|e| e.to_string()),
+                            clone!(#[strong] list, #[strong] row, #[weak] btn,
+                                move |res: Result<(), String>| match res {
+                                    Ok(()) => list.remove(&row),
+                                    Err(_) => btn.set_sensitive(true),
+                                }),
+                        );
                     }
                 ));
                 list.append(&row);
@@ -1134,10 +1282,7 @@ fn app_section(
 
             let vm_scan = (*vm).clone();
             run_async(
-                move || match kind {
-                    Kind::Host => potjie_core::desktop::list_host_apps().map_err(|e| e.to_string()),
-                    Kind::Vm => vm_scan.list_guest_apps().map_err(|e| e.to_string()),
-                },
+                move || vm_scan.list_guest_apps().map_err(|e| e.to_string()),
                 clone!(#[strong] vm, #[strong] list, #[strong] scanned, #[weak] window,
                 #[strong] refresh_wrappers,
                 move |res: Result<Vec<DesktopEntry>, String>| {
@@ -1203,13 +1348,20 @@ fn make_wrapper(
         clone!(#[weak] window, move |name| {
             let Some(name) = name.filter(|n| !n.trim().is_empty()) else { return; };
             let launcher = launcher_path();
-            match potjie_core::desktop::create_wrapper(&vm.cfg.name, kind, &entry, name.trim(), &launcher) {
-                Ok(path) => {
-                    info(&window, "Launcher created", &format!("Created:\n{}", path.display()));
-                    refresh_wrappers(); // show it in the "Created launchers" list right away
-                }
-                Err(e) => info(&window, "Could not create launcher", &e.to_string()),
-            }
+            // create_wrapper drives the portal install dialog, so it must run off
+            // the UI thread; the result comes back on the main context.
+            let box_name = vm.cfg.name.clone();
+            let name = name.trim().to_string();
+            let entry = entry.clone();
+            run_async(
+                move || potjie_core::desktop::create_wrapper(&box_name, kind, &entry, &name, &launcher)
+                    .map_err(|e| e.to_string()),
+                clone!(#[weak] window, #[strong] refresh_wrappers,
+                    move |res: Result<(), String>| match res {
+                        Ok(()) => refresh_wrappers(), // show it in the list right away
+                        Err(e) => info(&window, "Could not create launcher", &e),
+                    }),
+            );
         }));
 }
 
@@ -1628,6 +1780,12 @@ fn spawn_shell_in_terminal(
     box_name: &str,
     pid: &Rc<Cell<Option<i32>>>,
 ) {
+    // Clear screen + scrollback so each session starts on a blank slate.
+    // Doing this via VTE's API (not escape sequences) is synchronous —
+    // VTE's cursor is at (1,1) before the child process runs, preventing the
+    // CPR-at-row-N garbage caused by a cursor tracking race on reconnect.
+    term.reset(false, true);
+
     let cli = potjie_cli();
     let cli = cli.to_string_lossy().to_string();
     let argv = [cli.as_str(), "ssh", box_name];

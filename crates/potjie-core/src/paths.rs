@@ -39,6 +39,11 @@ pub fn img_dir() -> Result<PathBuf> {
 }
 
 /// Ephemeral per-user runtime root, on tmpfs where available.
+///
+/// In the Flatpak this is the sandbox's own `$XDG_RUNTIME_DIR`, which is fine
+/// because qemu/ssh are *bundled* and run in-sandbox — they share the same mount
+/// and PID namespaces as the daemon, so LUKS key material and sockets stay on
+/// tmpfs and never touch persistent storage.
 pub fn runtime_root() -> Result<PathBuf> {
     let base = std::env::var_os("XDG_RUNTIME_DIR")
         .map(PathBuf::from)

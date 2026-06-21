@@ -333,17 +333,62 @@ fn notify_body(box_name: &str, running: bool) -> String {
     }
 }
 
-/// Run `notify-send` to completion (best effort; a no-op if it isn't installed).
-/// Reaps the child, so no zombies.
-fn send_notification(body: &str) {
-    let _ = std::process::Command::new("notify-send")
-        .arg("--app-name=Potjie")
-        .arg("Potjie")
-        .arg(body)
+/// Quote a string as a GVariant text-format literal (double-quoted so embedded
+/// single quotes — e.g. `Box 'dev' …` — don't need escaping).
+fn gvariant_str(s: &str) -> String {
+    format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+/// Fire-and-forget a `gdbus call`, returning whether it succeeded.
+fn gdbus_call(args: &[&str]) -> bool {
+    std::process::Command::new("gdbus")
+        .args(["call", "--session"])
+        .args(args)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
-        .status();
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Send a desktop notification. Prefers the **Notification portal**
+/// (`org.freedesktop.portal.Notification.AddNotification`) — it needs no bus
+/// `--talk-name` finish-arg, so the Flatpak stays least-privilege. Outside
+/// Flatpak (e.g. the daemon run directly during dev) the portal may be absent,
+/// so we fall back to a direct `org.freedesktop.Notifications.Notify`; inside the
+/// sandbox that name isn't reachable and the fallback simply no-ops.
+fn send_notification(body: &str) {
+    // AddNotification replaces any notification with the same id, so a unique id
+    // per event lets start/stop stack instead of overwriting each other.
+    let id = format!(
+        "potjie-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    );
+    let vardict = format!(
+        "{{'title': <{}>, 'body': <{}>, 'icon': <('themed', <['com.potjie.Potjie']>)>}}",
+        gvariant_str("Potjie"),
+        gvariant_str(body),
+    );
+    let portal_ok = gdbus_call(&[
+        "--dest", "org.freedesktop.portal.Desktop",
+        "--object-path", "/org/freedesktop/portal/desktop",
+        "--method", "org.freedesktop.portal.Notification.AddNotification",
+        &id, &vardict,
+    ]);
+    if portal_ok {
+        return;
+    }
+    let _ = gdbus_call(&[
+        "--dest", "org.freedesktop.Notifications",
+        "--object-path", "/org/freedesktop/Notifications",
+        "--method", "org.freedesktop.Notifications.Notify",
+        "Potjie", "0", "com.potjie.Potjie", "Potjie", body,
+        "[]", "{}", "5000",
+    ]);
 }
 
 /// Fire a start/stop notification from the watchdog. Spawned on its own thread so

@@ -470,12 +470,178 @@ launches GTK on CachyOS (non-NixOS, no host /nix). Notes:
       the rule, host→box port auto-mirroring, Enter-to-add, and an inline *Advanced*
       expander for the rarely-used destination host. New `Forward::{from_ports,host_port,
       box_port}` helpers in core; `summary()` now reads `Host :8000 → Box :8080`.
+- [x] **Flatpak: run host tools via `flatpak-spawn --host`**: the wrapper pointed qemu at
+      `/run/host/usr/bin/qemu-system-x86_64`, but executing a host binary *inside* the sandbox
+      fails to load its shared libs (`libcapstone.so.5` → exit 127). Added `tools::host_command`
+      (prefixes `flatpak-spawn --host` when `/.flatpak-info` exists) and routed qemu-system,
+      qemu-img, and ssh through it; binaries now resolve on the *host* PATH by plain name.
+      Manifest gains `--talk-name=org.freedesktop.Flatpak`; wrapper no longer sets POTJIE_QEMU_*.
+      NOTE still in-sandbox (non-blocking): daemon `notify-send` (likely absent in runtime →
+      notifications no-op) and `sh` for tracked app launchers (present, fine).
+- [x] **Flatpak: shared runtime dir**: `$XDG_RUNTIME_DIR` (`/run/user/<uid>`) is *private* to a
+      Flatpak app, so the in-sandbox daemon's secret files / QMP socket / pidfiles / ssh control
+      sockets were invisible to host qemu+ssh (qemu: "Unable to read …/secret-NN"). `runtime_root()`
+      now returns `~/.potjie/run` when `in_flatpak()` (home is host-shared, identical path in both
+      namespaces); native keeps the tmpfs `$XDG_RUNTIME_DIR/potjie`. CAVEAT: `~/.potjie/run`
+      persists across host reboots (not tmpfs) → stale pidfiles/sockets could linger; rely on the
+      daemon's liveness checks / stale-socket cleanup.
+- [x] **Flatpak PIVOT → bundle everything (Flathub-bound)**: the `flatpak-spawn --host` approach
+      below (libcapstone/secret-path/pid-namespace fixes) *worked* but needs
+      `--talk-name=org.freedesktop.Flatpak` = a sandbox escape Flathub rejects. Pivoted to
+      bundling qemu (11.0.1, x86_64-softmmu + tools, prebuilt firmware), libslirp (4.9.3), and
+      OpenSSH client (10.3p1) as flatpak modules so all tools run in-sandbox. CODE: reverted the
+      three host-spawn hacks (`tools::host_command`/`in_flatpak`, `runtime_root` `~/.potjie/run`
+      branch, `pid_alive`/`signal` host-kill) — bundled-in-sandbox == native, so the native code
+      path is correct again (tmpfs runtime dir, normal `kill`). MANIFEST: dropped the talk-name and
+      the host-qemu wrapper (`command: potjie-gtk` directly). KEPT: `ControlPersist=yes` forward
+      fix + GTK Ports UI overhaul. STILL coarse (next pruning steps): `--device=all`→kvm/dri,
+      `--filesystem=host`→app data dir, `--socket=session-bus`→talk-names.
+- [x] ~~**Flatpak: cross-namespace qemu liveness**~~ (REVERTED by the bundling pivot above): qemu runs in the *host* PID namespace, so the
+      in-sandbox daemon's `kill(pid,0)` saw ESRCH and reported "box is not running" (deleting the
+      pidfile as stale). `pid_alive`/`signal` now route through `flatpak-spawn --host kill` when
+      `in_flatpak()`. FOLLOW-UP: `box_process_running` (sealed-assurance /proc scan) still scans the
+      *sandbox* /proc and won't see host qemu — needs a host-side scan via flatpak-spawn; until then
+      the "is anything decrypting this box?" assurance is unreliable inside the flatpak.
+- [x] **Fix forwards dying ~30s after boot**: `start_master` (run on box acquire) brought
+      the forward control master up, but the managed ssh config's `ControlPersist 30s` idled
+      it out seconds later since the master runs no sessions — so `LocalForward` host ports
+      stopped listening (`curl` → connection refused; or "reset" in the brief window the
+      master was alive but pointed at a dead dest). Fix: `start_master` now passes
+      `-o ControlPersist=yes` so the forward master persists for the box's lifetime (daemon
+      still tears it down via `stop_master`). Verified end-to-end: host `curl localhost:8000`
+      → box's `python3 -m http.server 8080` directory listing.
+- [x] **Two shell-tab terminal bugs fixed (2026-06-21)**:
+  1. **`^[[48;1R` CPR garbage on first boot**: The QEMU serial console log
+     contained raw `\033[6n]` (cursor-position query) escape sequences from the
+     guest's boot output. `stream_console` wrote these verbatim to stdout →
+     VTE responded with a CPR at row 48 (bottom of screen after the boot log
+     filled it) → the CPR got buffered in the PTY → SSH forwarded it to the
+     remote before bash's readline set NOECHO → the guest's line discipline
+     echoed it as visible `^[[48;1R]` text (ECHOCTL rendering ESC as `^[`).
+     Fix: `strip_dsr()` in `potjie-cli/src/main.rs` removes `\x1b[6n]` /
+     `\x1b[?6n]` from console log bytes before writing to stdout.
+  2. **Old session content accumulating on reconnect**: `spawn_shell_in_terminal`
+     never cleared VTE between sessions. Fix: call `term.reset(false, true)`
+     (VTE API, synchronous, clears screen + scrollback) before each spawn —
+     also resets VTE's internal cursor to (1,1) as a bonus, preventing the
+     CPR-at-stale-row issue on reconnect.
+- [x] **Two Flatpak bugs fixed (2026-06-21)**:
+  1. **UI freeze + VM stop on tab-switch**: `daemon_is_current` in `guard.rs`
+     compared the *full exe path* of the daemon (`/app/bin/potjie`) against the
+     GUI's exe (`/app/bin/potjie-gtk`) — different filenames always triggered the
+     "stale daemon" path, killing the daemon and blocking the GTK main thread for
+     ~3 s while it respawned. The new daemon's startup sweep then stopped the VM
+     (zero leases). Fix: compare *parent directories* instead of full paths — both
+     binaries live in the same `bin/` dir, so a dir change means a real reinstall.
+  2. **No notifications on Niri**: `notify-send` inside the Flatpak sandbox routes
+     via the XDG portal on non-GNOME compositors, which silently drops. Direct
+     `org.freedesktop.Notifications` D-Bus access (bypassing the portal) also
+     failed via `notify-send`. `gdbus call` to the same name works. Replaced
+     `send_notification` in the daemon: now calls `gdbus call --session
+     --dest org.freedesktop.Notifications … Notify …` directly.
+     (`shelly-notifications` is the notification daemon on this system.)
+- [x] **Flatpak permissions tightened for Flathub (2026-06-20)**. Replaced three
+      over-broad permissions with fine-grained equivalents that Flathub's policy
+      accepts:
+  - `--filesystem=host` → `--filesystem=~/.potjie:create` + `--filesystem=~/.ssh`
+    + `--filesystem=xdg-data/applications:create`
+  - `--device=all` → `--device=kvm` (QEMU acceleration) + `--device=dri` (GTK4/Vulkan)
+  - `--socket=session-bus` → `--talk-name=org.freedesktop.Notifications`
+  - `runtime-version` bumped from the unreleased `'50'` to stable `'48'`. The `'50'`
+    runtime ships a libadwaita whose `color-scheme` portal reading is buggy on
+    non-GNOME Wayland compositors (e.g. niri), causing the UI to render in light
+    mode even when the system is set to dark.
+  - Added `--app-id=com.potjie.Potjie` and `--icon=com.potjie.Potjie` to
+    `notify-send` calls: libnotify ≥ 0.8 routes via `org.freedesktop.portal.
+    Notification` inside Flatpak and needs the app ID to match the installed icon
+    and desktop entry — without it, portal notifications are silently dropped.
+  - Added icon installation (SVG + 128 + 256 PNG), MetaInfo XML (`com.potjie.Potjie.
+    metainfo.xml`), and `StartupWMClass`/`X-GNOME-UsesNotifications=true` to the
+    desktop file. All three are hard requirements for Flathub submission.
+  - VTE git source now includes explicit `commit:` SHA for reproducible builds.
+- [x] **`~/.ssh/config` dropped to read-only (2026-06-21)**. The biggest least-privilege
+      red flag for Flathub review was *write* access to the user's SSH config (it can
+      carry `ProxyCommand`/`IdentityFile` — too sensitive to grant). Potjie no longer
+      edits it at all:
+  - `--filesystem=~/.ssh/config` → `--filesystem=~/.ssh/config:ro`.
+  - `sync_ssh_config` (core) now only writes our own fragment under `~/.potjie`;
+    the old `ensure_ssh_include` (which prepended `Include …` to `~/.ssh/config`) is
+    gone, replaced by read-only `ssh_include_status()` + `IncludeStatus`
+    {Present, OptedOut, Missing} and a `set_ssh_include_optout` marker in `~/.potjie`.
+  - The GTK app gates the main window behind an inline setup screen
+    (`build_ssh_gate`, no modal — tiling-WM rule) when the Include line is Missing:
+    shows the exact line + a Copy button, a "continue" re-check, and a deliberately
+    buried skip (Expander → `destructive-action`) that warns Potjie is half-broken
+    without it but records the opt-out so it won't nag again.
+- [x] **Notifications moved to the portal; `--talk-name` dropped (2026-06-21)**.
+      `send_notification` (daemon) now calls `org.freedesktop.portal.Notification.
+      AddNotification` first — the portal needs **no** bus finish-arg — and only
+      falls back to a direct `org.freedesktop.Notifications.Notify` outside Flatpak
+      (dev on host), where the bus is unrestricted anyway. So
+      `--talk-name=org.freedesktop.Notifications` is removed from the manifest.
+      Verified the `AddNotification` gdbus call fires on the niri host (exit 0).
+- [x] **Launchers moved to the DynamicLauncher portal; `xdg-data/applications`
+      grant dropped (2026-06-21)**. App launchers are no longer written to
+      `~/.local/share/applications` — Potjie has no filesystem access there at all,
+      so it can never touch another app's `.desktop` files. Implementation:
+  - `crates/potjie-core/src/desktop.rs`: `create_wrapper`/`remove_wrapper`/
+    `remove_wrappers_for_box` now call `org.freedesktop.portal.DynamicLauncher`
+    (`PrepareInstall`→`Install` / `Uninstall`) via the `ashpd` crate (tokio feature,
+    `block_on` on a throwaway current-thread runtime). The portal forces every
+    `desktop_file_id` to be prefixed with our app id (`com.potjie.Potjie.…`).
+  - The portal has **no enumerate API**, so `list_wrappers` reads a small JSON
+    registry at `~/.potjie/launchers.json` instead of scanning a dir; `prune_wrappers`
+    self-heals it via `GetDesktopEntry` (drops launchers the user removed elsewhere).
+  - `Wrapper.path: PathBuf` → `Wrapper.file_id: String`. GTK `make_wrapper`/remove
+    now run the portal calls off the UI thread (`run_async`, since `PrepareInstall`
+    shows a dialog); the apps tab kicks a background `prune_wrappers` on open.
+  - Verified end-to-end on the niri host (PrepareInstall dialog → Install → readback
+    confirms `--launch` args + auto-added `Icon=` → Uninstall). Exec only needs to be
+    a valid absolute path (`launcher_path()` / `$APPIMAGE` both qualify); the portal
+    rewrites it under Flatpak.
+  - New deps (ashpd, tokio, zbus, …) grew `Cargo.lock`; `flatpak/cargo-sources.json`
+    regenerated (569 entries). **Flatpak Exec rewrite still needs a real in-sandbox
+    test build.**
 - [x] **Fix flaky add/delete in Ports tab**: the row list was mutated optimistically
       *before* the async daemon write, so a failed write (e.g. a daemon spawn race after
       idle-exit) silently left `box.json` unchanged and the "deleted" forward reappeared
       on the next panel rebuild. Now the daemon write happens first and the in-memory
       list is committed only on success; failures keep the rows and show a loud (`.error`)
       status. Backend verified fine via CLI round-trip (`forward add/list/rm`).
+- [x] **Host-app wrapping removed (2026-06-21)**. `Kind::Host` ("run a *native host*
+      app while the box is up, connect into it over SSH") **cannot work in a Flathub
+      Flatpak and never could**: the `--launch` wrapper ran the host app *inside the
+      sandbox* (`potjie __run-tracked -- <exec>`), where the host binary/libs don't
+      exist → it exited ~instantly (127) → the lease dropped → the daemon re-locked the
+      box. That's the "launches then quits immediately after opening" symptom. It's
+      structural, not a patchable bug: spawning a host process from the sandbox is a
+      sandbox escape, and **both** routes are blocked by Flathub —
+      `--talk-name=org.freedesktop.Flatpak` (flatpak-spawn) and the **DynamicLauncher
+      portal, which *overrides* any `Exec` we write to re-enter the sandbox** (ashpd
+      `dynamic_launcher.rs`: "Exec will be overridden to call `flatpak run our-app` if
+      the application is sandboxed"), so even an inline host command in the `.desktop`
+      is impossible by design. So `Kind::Host` was deleted: `desktop::{list_host_apps,
+      resolve_host_exec, host_app_dirs, parse_desktop_file, strip_field_codes}` and the
+      `Kind::Host` variant gone; `launch.rs::run_host_app` gone; the Apps tab's "Host
+      applications" section gone (Box/guest apps via `Kind::Vm` unchanged — they list
+      over SSH and run X-forwarded in-sandbox, which works). **Manifest tightened**:
+      `/run/host` now has no consumers, so dropped `--filesystem=host-os:ro` +
+      `~/.local/share/applications:ro` + the two flatpak-exports `:ro` mounts (net
+      least-privilege win for Flathub). The replacement for the use case (host Zed +
+      Remote-SSH into a box) is a planned **SSH-connection-tied box lifecycle**
+      (ProxyCommand-as-lease over the shared `~/.potjie` daemon socket; daemon spawns a
+      passphrase window on connect; re-lock on disconnect) — needs no new permissions;
+      not yet built.
+- [ ] **SSH-connection-tied lifecycle (host-tool access, Flathub-clean)**: box boots
+      when host ssh/Zed connects to `potjie-<box>` and re-locks when the last session
+      drops. Pieces: ProxyCommand in the managed ssh fragment that holds the lease over
+      a host-visible daemon socket under `~/.potjie`; daemon-spawned `potjie-gtk
+      --ask-passphrase` prompt on a locked box (the one deliberate floating-window
+      exception, since the trigger is an ssh connect with no inline surface). Open
+      verification first: host ssh can reach `potjie-<box>` end-to-end (the fragment's
+      `ControlPath` currently points at the sandbox-private runtime dir and will need
+      relocating), and the ProxyCommand's host-tool dependency (`socat`/`nc` vs a tiny
+      helper).
 - [ ] Harden: QMP-based status/port (vs
       pidfile), daemon socket peer-cred check, resize/clone/snapshot, per-box
       port-forward config beyond SSH, error surfacing/toasts

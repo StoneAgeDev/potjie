@@ -50,6 +50,7 @@
             vkicds=$(echo ${pkgs.mesa}/share/vulkan/icd.d/*.json | tr ' ' ':')
             wrapProgram $out/bin/potjie-gtk \
               "''${gappsWrapperArgs[@]}" \
+              --set GDK_BACKEND wayland,x11 \
               --set POTJIE_QEMU_SYSTEM ${pkgs.qemu}/bin/qemu-system-x86_64 \
               --set POTJIE_QEMU_IMG ${pkgs.qemu}/bin/qemu-img \
               --set POTJIE_BIN $out/bin/potjie \

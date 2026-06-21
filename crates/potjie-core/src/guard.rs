@@ -50,10 +50,27 @@ impl Drop for Lease {
 }
 
 /// Connect to the daemon, starting it first if necessary.
+/// If an existing daemon is running a different binary (stale after a rebuild),
+/// it is terminated and a fresh one is spawned automatically.
 fn connect() -> Result<UnixStream> {
     let path = socket_path()?;
     if let Ok(s) = UnixStream::connect(&path) {
-        return Ok(s);
+        if daemon_is_current(&s) {
+            return Ok(s);
+        }
+        // Stale daemon (different binary). Kill it and fall through to respawn.
+        if let Some(pid) = peer_pid(&s) {
+            unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+        }
+        drop(s);
+        // Wait for the socket to disappear before spawning the replacement.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while path.exists() {
+            if Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
     }
     ensure_daemon()?;
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -65,6 +82,42 @@ fn connect() -> Result<UnixStream> {
             bail!("guard daemon did not come up at {}", path.display());
         }
         std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// Return the PID of the process on the other end of a Unix socket.
+fn peer_pid(stream: &UnixStream) -> Option<u32> {
+    use std::os::unix::io::AsRawFd;
+    let mut cred = libc::ucred { pid: 0, uid: 0, gid: 0 };
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    let ret = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            &mut cred as *mut _ as *mut libc::c_void,
+            &mut len,
+        )
+    };
+    if ret == 0 { Some(cred.pid as u32) } else { None }
+}
+
+/// True if the daemon on the other end of the socket is from the same
+/// installation as us. Compares parent directories rather than full exe paths
+/// so that the GUI (`potjie-gtk`) and the daemon (`potjie`) — which live
+/// together in the same `bin/` directory — are never considered mismatched.
+/// A directory change means a new Flatpak version or a reinstall.
+fn daemon_is_current(stream: &UnixStream) -> bool {
+    let Some(pid) = peer_pid(stream) else { return true };
+    let daemon_dir = std::fs::read_link(format!("/proc/{pid}/exe"))
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()));
+    let our_dir = std::fs::read_link("/proc/self/exe")
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()));
+    match (daemon_dir, our_dir) {
+        (Some(d), Some(o)) => d == o,
+        _ => true, // can't tell → assume ok
     }
 }
 

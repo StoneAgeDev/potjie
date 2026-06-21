@@ -315,7 +315,7 @@ fn stream_console(path: &std::path::Path, mut pos: u64) -> u64 {
                     if f.read_to_end(&mut buf).is_ok() {
                         let out = std::io::stdout();
                         let mut h = out.lock();
-                        h.write_all(&buf).ok();
+                        h.write_all(&strip_dsr(&buf)).ok();
                         h.flush().ok();
                         pos += buf.len() as u64;
                     }
@@ -324,6 +324,30 @@ fn stream_console(path: &std::path::Path, mut pos: u64) -> u64 {
         }
     }
     pos
+}
+
+/// Remove DSR cursor-position queries (`\x1b[6n`, `\x1b[?6n`) from raw console
+/// bytes before writing them to the terminal.  The boot log is display-only;
+/// these queries cause the outer terminal emulator (VTE) to emit a CPR response
+/// that gets buffered in the PTY, then SSH picks it up, the remote guest echoes
+/// it under ECHOCTL while bash's readline hasn't yet set RAW mode, and the user
+/// sees `^[[48;1R` printed as garbage text.
+fn strip_dsr(bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        // \x1b[6n  (DECDSR)
+        if bytes[i..].starts_with(b"\x1b[6n") {
+            i += 4;
+        // \x1b[?6n  (DECXCPR)
+        } else if bytes[i..].starts_with(b"\x1b[?6n") {
+            i += 5;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    out
 }
 
 fn hold(name: &str) -> Result<()> {

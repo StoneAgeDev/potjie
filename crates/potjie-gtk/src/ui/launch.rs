@@ -1,13 +1,12 @@
-//! Wrapper mode: `potjie-gtk --launch <box> <host|vm> <app-id>`.
+//! Wrapper mode: `potjie-gtk --launch <box> <kind> <app-id>`.
 //!
 //! Invoked by generated `.desktop` files. It *leases* the box from the guard
 //! daemon for exactly as long as the wrapped app runs, then drops the lease so
 //! the daemon re-locks the box. A crash of this launcher also re-locks the box
 //! (the lease is a live socket).
 //!
-//!   * `vm`   — run the guest app in the foreground over X-forwarded SSH.
-//!   * `host` — run a native host app in the foreground; it reaches the box over
-//!     local SSH via the `potjie-<box>` alias (kept current by the daemon).
+//! The wrapped app runs *inside* the box (guest) in the foreground over
+//! X-forwarded SSH, so this process lasts exactly as long as the app does.
 
 use super::run_async;
 use gtk::glib::{self, clone};
@@ -17,7 +16,7 @@ use gtk::{
     TextView,
 };
 use potjie_core::desktop::Kind;
-use potjie_core::{desktop, guard, Vm};
+use potjie_core::{guard, Vm};
 use std::cell::Cell;
 use std::rc::Rc;
 
@@ -127,7 +126,6 @@ fn launch_with(
                 let lease = guard::acquire(&box_name, &pass).map_err(|e| e.to_string())?;
                 let status = match kind {
                     Kind::Vm => run_guest_app(&vm, &app_id),
-                    Kind::Host => run_host_app(&box_name, &vm, lease.ssh_port, &app_id),
                 };
                 drop(lease);
                 status
@@ -217,7 +215,6 @@ fn launch_with(
             let _ = booted_tx.send_blocking(());
             let status = match kind {
                 Kind::Vm => run_guest_app(&vm, &app_id),
-                Kind::Host => run_host_app(&box_name, &vm, lease.ssh_port, &app_id),
             };
             drop(lease);
             status
@@ -275,25 +272,5 @@ fn run_guest_app(vm: &Vm, app_id: &str) -> Result<(), String> {
         id = app_id
     );
     let mut cmd = vm.ssh_command_x11(Some(&remote)).map_err(|e| e.to_string())?;
-    cmd.status().map_err(|e| e.to_string()).map(|_| ())
-}
-
-/// Run a native host app, with the box reachable as `potjie-<box>` (and via
-/// `POTJIE_SSH_*` env vars). The app is run through `potjie __run-tracked`, which
-/// holds on until the app's **entire descendant tree** exits — so an app that
-/// forks/daemonizes and returns (VS Code, browsers, …) keeps the box up for its
-/// real lifetime instead of for a few milliseconds.
-fn run_host_app(box_name: &str, vm: &Vm, port: u16, app_id: &str) -> Result<(), String> {
-    let exec = desktop::resolve_host_exec(app_id)
-        .ok_or_else(|| format!("host app '{app_id}' not found"))?;
-    let mut cmd = std::process::Command::new(super::potjie_cli());
-    cmd.arg("__run-tracked")
-        .arg("--")
-        .arg(&exec)
-        .env("POTJIE_BOX", box_name)
-        .env("POTJIE_SSH_ALIAS", format!("potjie-{box_name}"))
-        .env("POTJIE_SSH_HOST", "127.0.0.1")
-        .env("POTJIE_SSH_PORT", port.to_string())
-        .env("POTJIE_SSH_USER", &vm.cfg.username);
     cmd.status().map_err(|e| e.to_string()).map(|_| ())
 }

@@ -67,6 +67,11 @@ pub fn start_master(name: &str) -> Result<()> {
     let status = ssh_base()?
         .args(["-N", "-f"]) // no remote command; fork to background after auth
         .args(["-o", "ExitOnForwardFailure=no"])
+        // This master carries the forwards and never runs a session, so the
+        // config's short `ControlPersist` would idle it out (and drop every
+        // forward) seconds after boot. Override it to persist for the box's
+        // lifetime; the daemon tears it down explicitly via `stop_master`.
+        .args(["-o", "ControlPersist=yes"])
         .arg(alias(name))
         .status()
         .context("starting ssh control master")?;
