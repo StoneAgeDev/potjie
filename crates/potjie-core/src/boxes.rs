@@ -19,31 +19,6 @@ pub struct Vm {
     pub paths: BoxPaths,
 }
 
-/// Positive, checked evidence that a box is genuinely decrypted and live — not a
-/// reassuring message, but facts gathered by actually talking to the guest.
-#[derive(Debug, Clone)]
-pub struct DecryptionProof {
-    /// The on-disk image really is LUKS-encrypted at rest (`qemu-img info`).
-    pub disk_is_luks: bool,
-    /// We authenticated to the guest with the box's own key — only possible if
-    /// qemu decrypted the disk with the passphrase and the guest booted.
-    pub ssh_authenticated: bool,
-    /// `/etc/machine-id` read live from the (decrypted) root filesystem.
-    pub machine_id: String,
-    /// Backing source of `/` inside the guest.
-    pub root_source: String,
-    /// `uname -srm` from the running guest.
-    pub kernel: String,
-}
-
-impl DecryptionProof {
-    /// True only when every check passed: encrypted at rest AND proven decrypted
-    /// live. This is the "100% confidence" gate.
-    pub fn is_verified(&self) -> bool {
-        self.disk_is_luks && self.ssh_authenticated && !self.machine_id.is_empty()
-    }
-}
-
 /// Positive, checked evidence that a box is **sealed** — encrypted at rest and
 /// not decrypted or reachable anywhere right now. This is the assurance you want
 /// when you're done: proof your data is locked away, not a comforting message.
@@ -111,7 +86,7 @@ impl Vm {
         passphrase: &str,
         progress: impl FnMut(u64, u64),
     ) -> Result<Self> {
-        validate_name(&cfg.name)?;
+        // BoxPaths::new validates the name (it becomes a dir and a hostname).
         let paths = BoxPaths::new(&cfg.name)?;
         if paths.exists() || paths.dir.exists() {
             bail!("box '{}' already exists", cfg.name);
@@ -203,42 +178,6 @@ impl Vm {
         Ok(ssh::ssh_command(&self.paths, &self.cfg.username, port, command))
     }
 
-    /// Gather checked evidence that the box is genuinely decrypted and running.
-    ///
-    /// Two independent facts: (1) `qemu-img info` shows the disk is LUKS-encrypted
-    /// at rest, and (2) we authenticate to the guest with the box's key and read
-    /// its root filesystem live — which is *only* possible if qemu decrypted that
-    /// disk with the correct passphrase. Together: the box is encrypted at rest
-    /// and proven decrypted right now.
-    pub fn verify_decrypted(&self) -> Result<DecryptionProof> {
-        let disk_is_luks = disk::is_luks_encrypted(&self.paths.disk).unwrap_or(false);
-
-        // Single round-trip reading positive evidence from the decrypted guest.
-        const PROBE: &str = "printf 'mid=%s\\n' \"$(cat /etc/machine-id)\"; \
-             printf 'root=%s\\n' \"$(findmnt -no SOURCE / 2>/dev/null || \
-                 df --output=source / 2>/dev/null | tail -1)\"; \
-             printf 'kern=%s\\n' \"$(uname -srm)\"";
-        let mut cmd = self.ssh_command(Some(PROBE))?;
-        let out = cmd.output().context("probing guest over ssh")?;
-        let ssh_authenticated = out.status.success();
-        let text = String::from_utf8_lossy(&out.stdout);
-        let field = |k: &str| {
-            text.lines()
-                .find_map(|l| l.strip_prefix(&format!("{k}=")))
-                .unwrap_or("")
-                .trim()
-                .to_string()
-        };
-
-        Ok(DecryptionProof {
-            disk_is_luks,
-            ssh_authenticated,
-            machine_id: field("mid"),
-            root_source: field("root"),
-            kernel: field("kern"),
-        })
-    }
-
     /// Gather checked evidence that the box is **sealed**: encrypted at rest and
     /// not decrypted/reachable anywhere. This is the post-use assurance.
     pub fn verify_sealed(&self) -> Result<SealProof> {
@@ -278,18 +217,6 @@ impl Vm {
         })
     }
 
-    /// Like [`Vm::ssh_command`] but with X11 forwarding for guest GUI apps.
-    pub fn ssh_command_x11(&self, command: Option<&str>) -> Result<std::process::Command> {
-        let port = self.status()?.ssh_port.context("box is not running")?;
-        Ok(ssh::ssh_command_opts(
-            &self.paths,
-            &self.cfg.username,
-            port,
-            command,
-            true,
-        ))
-    }
-
     /// Permanently delete the box (must be stopped).
     pub fn delete(&self) -> Result<()> {
         if self.status()?.running {
@@ -298,31 +225,8 @@ impl Vm {
         std::fs::remove_dir_all(&self.paths.dir)
             .with_context(|| format!("removing {}", self.paths.dir.display()))?;
         std::fs::remove_dir_all(&self.paths.runtime_dir).ok();
-        // The box's generated launchers now point at a box that no longer exists;
-        // remove them so they don't linger as dead menu entries. (Cascades for the
-        // CLI `potjie rm` too, not just the GUI.)
-        if let Err(e) = crate::desktop::remove_wrappers_for_box(&self.cfg.name) {
-            eprintln!("warning: could not remove launchers for '{}': {e}", self.cfg.name);
-        }
         Ok(())
     }
-}
-
-/// Box names become directory names and host hostnames, so keep them strict.
-fn validate_name(name: &str) -> Result<()> {
-    if name.is_empty() || name.len() > 63 {
-        bail!("box name must be 1..=63 characters");
-    }
-    if !name
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '-')
-    {
-        bail!("box name may only contain ASCII letters, digits and '-'");
-    }
-    if name.starts_with('-') || name.ends_with('-') {
-        bail!("box name must not start or end with '-'");
-    }
-    Ok(())
 }
 
 /// Tiny helper: first resolved socket address.

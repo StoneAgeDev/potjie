@@ -20,9 +20,11 @@ use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-/// Path to the daemon control socket.
+/// Path to the daemon control socket. Lives in [`paths::control_dir`], which under
+/// Flatpak is the home-shared `~/.potjie/run` so every sandbox instance (GUI and
+/// each `proxy` ProxyCommand) talks to the *same* daemon.
 pub fn socket_path() -> Result<PathBuf> {
-    Ok(paths::runtime_root()?.join(SOCKET_NAME))
+    Ok(paths::control_dir()?.join(SOCKET_NAME))
 }
 
 /// An active lease. While this value lives, the box is guaranteed to stay
@@ -162,7 +164,7 @@ fn send_recv(stream: &mut UnixStream, req: &Request) -> Result<Response> {
     if line.trim().is_empty() {
         bail!("daemon closed the connection");
     }
-    Ok(serde_json::from_str(&line).context("parsing response")?)
+    serde_json::from_str(&line).context("parsing response")
 }
 
 /// One-shot request on a fresh connection.
@@ -247,10 +249,3 @@ pub fn get_forwards(box_name: &str) -> Result<Vec<Forward>> {
     }
 }
 
-/// True if a daemon is already listening.
-pub fn daemon_running() -> bool {
-    socket_path()
-        .ok()
-        .map(|p| UnixStream::connect(p).is_ok())
-        .unwrap_or(false)
-}

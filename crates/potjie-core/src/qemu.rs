@@ -94,42 +94,49 @@ pub fn start(paths: &BoxPaths, cfg: &crate::config::BoxConfig, passphrase: &str)
     Ok(ssh_port)
 }
 
-/// Scan `/proc` for *any* qemu process running this box, independent of our
-/// pidfile. This is the trustworthy "is anything decrypting this box right now?"
-/// check for the sealed-assurance: it catches an escaped or stale qemu that a
-/// missing pidfile would hide.
-pub fn box_process_running(name: &str) -> bool {
+/// Scan `/proc` for the qemu process running this box (matched by its unique
+/// `-name potjie-<box>` arg), returning its pid. Independent of our pidfile, so
+/// it catches a qemu whose pidfile was lost — to a crash, a stale-daemon race,
+/// or a stop that removed the pidfile without actually killing the process. This
+/// is the trustworthy "is anything decrypting this box right now?" probe.
+pub fn box_process_pid(name: &str) -> Option<i32> {
     let marker = format!("potjie-{name}");
-    let Ok(entries) = std::fs::read_dir("/proc") else {
-        return false;
-    };
-    for e in entries.flatten() {
+    for e in std::fs::read_dir("/proc").ok()?.flatten() {
         let fname = e.file_name();
         let Some(s) = fname.to_str() else { continue };
-        if !s.bytes().all(|b| b.is_ascii_digit()) {
-            continue; // not a pid dir
-        }
+        let Ok(pid) = s.parse::<i32>() else { continue }; // not a pid dir
         let Ok(cmdline) = std::fs::read(e.path().join("cmdline")) else { continue };
         // cmdline is NUL-separated argv; require an exact "potjie-<name>" arg so
         // box "dev" doesn't match box "dev2".
         if cmdline.split(|b| *b == 0).any(|arg| arg == marker.as_bytes()) {
-            return true;
+            return Some(pid);
         }
     }
-    false
+    None
+}
+
+/// True if any qemu is currently running (decrypting) this box.
+pub fn box_process_running(name: &str) -> bool {
+    box_process_pid(name).is_some()
 }
 
 /// Current status of the box.
+///
+/// Trusts the pidfile first, but falls back to a `/proc` scan: a box whose
+/// pidfile was removed out from under a still-live qemu (a crash, a stale-daemon
+/// race, a `stop` that cleaned up before the kill took) must still report
+/// **running**. Otherwise it ghosts as "stopped" while qemu keeps the disk
+/// decrypted — and nothing can re-lock it because `stop` thinks it's gone.
 pub fn status(paths: &BoxPaths) -> Result<Status> {
-    let Some(pid) = read_pid(&paths.pid_file) else {
-        return Ok(Status { running: false, pid: None, ssh_port: None });
-    };
-    if !pid_alive(pid) {
-        // Stale pidfile from a crashed/killed qemu; clean up the leftover state.
+    let pid = read_pid(&paths.pid_file)
+        .filter(|p| pid_alive(*p))
+        .or_else(|| box_process_pid(&paths.name));
+    let Some(pid) = pid else {
+        // Genuinely stopped; clean up any leftover runtime state.
         std::fs::remove_file(&paths.pid_file).ok();
         std::fs::remove_file(&paths.ssh_port_file).ok();
         return Ok(Status { running: false, pid: None, ssh_port: None });
-    }
+    };
     let ssh_port = std::fs::read_to_string(&paths.ssh_port_file)
         .ok()
         .and_then(|s| s.trim().parse().ok());

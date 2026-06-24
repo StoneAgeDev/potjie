@@ -1,6 +1,6 @@
 //! Locating the external qemu binaries Potjie drives.
 //!
-//! By default we trust `PATH`. A bundled distribution (AppImage/Flatpak) can
+//! By default we trust `PATH`. A bundled distribution (the Flatpak) can
 //! point at its own copies via `POTJIE_QEMU_IMG` / `POTJIE_QEMU_SYSTEM`, which
 //! is how Potjie stays self-contained on immutable hosts.
 
@@ -19,24 +19,41 @@ pub fn qemu_system() -> String {
     resolve("POTJIE_QEMU_SYSTEM", "qemu-system-x86_64")
 }
 
-/// Path to the multicall `potjie` binary (CLI + `potjie daemon`). Defaults to a
-/// `potjie` sitting next to the current executable — so the GTK app finds the
-/// sibling `potjie`, and the CLI finds itself — falling back to `PATH`. A bundled
-/// distribution overrides it with `POTJIE_BIN` (e.g. the copy materialized into
-/// `~/.potjie/bin`).
-pub fn potjie_bin() -> String {
-    if let Ok(p) = std::env::var("POTJIE_BIN") {
+/// Resolve a sibling binary: an explicit `$<env>` override → a binary of the
+/// given name next to the current executable → bare `name` (found via `PATH`).
+/// This is how the GTK app finds the sibling `potjie`, the CLI finds itself, and
+/// a bundled distribution can point at its own copies.
+fn resolve_sibling(env: &str, name: &str) -> String {
+    if let Ok(p) = std::env::var(env) {
         return p;
     }
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
-            let cand = dir.join("potjie");
+            let cand = dir.join(name);
             if cand.exists() {
                 return cand.to_string_lossy().into_owned();
             }
         }
     }
-    "potjie".to_string()
+    name.to_string()
+}
+
+/// Path to the multicall `potjie` binary (CLI + `potjie daemon`). `POTJIE_BIN` →
+/// sibling `potjie` → `PATH`.
+pub fn potjie_bin() -> String {
+    resolve_sibling("POTJIE_BIN", "potjie")
+}
+
+/// Sentinel prefix the `potjie-gtk --ask-passphrase` window prints its result
+/// with, so the daemon can pick the passphrase line out of any incidental GTK
+/// stdout noise. The control bytes make an accidental collision implausible.
+pub const ASK_PASSPHRASE_PREFIX: &str = "\u{1}potjie-pass\u{1}";
+
+/// Path to the `potjie-gtk` binary (the GUI). The daemon spawns it to draw the
+/// passphrase prompt when an ssh connection boots a locked box (`--ask-passphrase`).
+/// `POTJIE_GTK_BIN` → sibling `potjie-gtk` → `PATH`, mirroring [`potjie_bin`].
+pub fn potjie_gtk_bin() -> String {
+    resolve_sibling("POTJIE_GTK_BIN", "potjie-gtk")
 }
 
 /// Run a command, returning an error that includes stderr on failure.

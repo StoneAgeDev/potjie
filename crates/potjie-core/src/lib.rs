@@ -28,7 +28,6 @@ pub mod disk;
 pub mod forward;
 pub mod guard;
 pub mod paths;
-pub mod proc;
 pub mod protocol;
 pub mod qemu;
 pub mod secret;
@@ -36,6 +35,6 @@ pub mod seed;
 pub mod ssh;
 pub mod tools;
 
-pub use boxes::{DecryptionProof, SealProof, Vm};
+pub use boxes::{SealProof, Vm};
 pub use config::{BaseImage, BoxConfig, DEFAULT_BASE};
 pub use qemu::Status;

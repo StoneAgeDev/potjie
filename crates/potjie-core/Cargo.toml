@@ -7,7 +7,6 @@ authors.workspace = true
 
 [dependencies]
 anyhow.workspace = true
-thiserror.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 dirs.workspace = true
@@ -17,8 +16,6 @@ fatfs = "0.3"
 fscommon = "0.1"
 ssh-key = { version = "0.6", features = ["ed25519", "std"] }
 rand_core = { version = "0.6", features = ["getrandom"] }
-ashpd = { version = "0.13.11", default-features = false, features = ["tokio", "dynamic_launcher"] }
-tokio = { version = "1.52.3", default-features = false, features = ["rt", "net", "time"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

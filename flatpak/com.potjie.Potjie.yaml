@@ -7,11 +7,12 @@ sdk-extensions:
 command: potjie-gtk
 
 finish-args:
-  # Display — wayland primary, X11 for X-forwarded guest apps.
-  # GDK_BACKEND forces GTK4 to use Wayland (not XWayland) so we get CSD instead
-  # of the compositor drawing a title bar over the app's own headerbar.
+  # Display — Wayland primary. `fallback-x11` (not full `--socket=x11`) grants X11
+  # only when Wayland is unavailable, so the GUI still runs on X11 desktops without
+  # the unrestricted X11 access Flathub flags. GDK_BACKEND prefers Wayland so we get
+  # CSD instead of the compositor drawing a title bar over our own headerbar.
   - --socket=wayland
-  - --socket=x11
+  - --socket=fallback-x11
   - --share=ipc
   - --env=GDK_BACKEND=wayland,x11
 
@@ -21,10 +22,6 @@ finish-args:
   # line that lets VS Code Remote-SSH / terminal ssh reach boxes by stable hostname;
   # the GUI walks them through adding it themselves (least privilege over a sensitive
   # file).
-  # NB: per-box app launchers need NO filesystem access — they're installed via the
-  # DynamicLauncher portal (org.freedesktop.portal.DynamicLauncher), which also
-  # guarantees every launcher is prefixed with our app id, so we can never touch
-  # another app's .desktop files.
   - --filesystem=~/.potjie:create
   - --filesystem=~/.ssh/config:ro
 

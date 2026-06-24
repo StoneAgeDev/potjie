@@ -1,6 +1,6 @@
 //! Fetching and verifying the pinned base image.
 
-use crate::config::{BaseImage, DEFAULT_BASE};
+use crate::config::BaseImage;
 use crate::paths;
 use anyhow::{bail, Context, Result};
 use sha2::{Digest, Sha512};
@@ -29,15 +29,28 @@ pub fn ensure_base(
         }
     }
 
-    download(base, &dest, &mut progress)
-        .with_context(|| format!("downloading base image from {}", base.url))?;
-    verify(&dest, base.sha512).context("verifying downloaded base image")?;
-    Ok(dest)
-}
-
-/// Convenience wrapper around [`ensure_base`] for the default base.
-pub fn ensure_default_base(progress: impl FnMut(u64, u64)) -> Result<PathBuf> {
-    ensure_base(&DEFAULT_BASE, progress)
+    // These images are hundreds of MiB; a transient network blip shouldn't sink
+    // the whole `create`. Retry a few times (download writes to a `.part` temp and
+    // only renames on success, so a failed attempt leaves no half file at `dest`).
+    const ATTEMPTS: u32 = 3;
+    let mut last_err = None;
+    for attempt in 1..=ATTEMPTS {
+        match download(base, &dest, &mut progress)
+            .with_context(|| format!("downloading base image from {}", base.url))
+            .and_then(|()| {
+                verify(&dest, base.sha512).context("verifying downloaded base image")
+            }) {
+            Ok(()) => return Ok(dest),
+            Err(e) => {
+                std::fs::remove_file(&dest).ok();
+                if attempt < ATTEMPTS {
+                    eprintln!("base image attempt {attempt}/{ATTEMPTS} failed ({e}); retrying");
+                }
+                last_err = Some(e);
+            }
+        }
+    }
+    Err(last_err.expect("loop runs at least once"))
 }
 
 fn download(base: &BaseImage, dest: &Path, progress: &mut impl FnMut(u64, u64)) -> Result<()> {

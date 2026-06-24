@@ -25,9 +25,12 @@ pub fn control_path(name: &str) -> Result<PathBuf> {
     Ok(paths::runtime_root()?.join(format!("control-{name}.sock")))
 }
 
-/// The SSH host alias Potjie generates for a box.
+/// The SSH host alias the daemon's forward control master connects through. This
+/// is the *direct* (no-ProxyCommand) alias, so the master connects straight to
+/// the box without taking a lease — distinct from the host-facing `potjie-<box>`
+/// alias that users/`ssh` go through.
 fn alias(name: &str) -> String {
-    format!("potjie-{name}")
+    format!("potjie-fwd-{name}")
 }
 
 /// A base `ssh` command pointed at the box via the Potjie-managed config, with

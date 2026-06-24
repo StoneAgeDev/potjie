@@ -46,6 +46,15 @@ fn total_leases(leases: &Leases) -> u32 {
     leases.lock().unwrap().values().sum()
 }
 
+/// True if any box is currently running. Used to keep the daemon alive past its
+/// idle deadline while it still owns a decrypted box (see the accept loop).
+fn any_box_running() -> bool {
+    Vm::list()
+        .unwrap_or_default()
+        .iter()
+        .any(|vm| vm.status().map(|s| s.running).unwrap_or(false))
+}
+
 /// Lease counts, keyed by box name. Wrapped in a mutex shared across handlers.
 type Leases = Arc<Mutex<HashMap<String, u32>>>;
 
@@ -71,6 +80,11 @@ pub fn run() -> Result<()> {
 
     // Fail-safe: lock anything that survived a previous daemon.
     sweep(&leases);
+
+    // Write the managed ssh fragment up front so `ssh potjie-<box>` resolves (and
+    // can boot the box on demand via its ProxyCommand) for *every* box, even ones
+    // that aren't running yet.
+    refresh_aliases();
 
     let listener = UnixListener::bind(&sock)
         .with_context(|| format!("binding {}", sock.display()))?;
@@ -121,8 +135,18 @@ pub fn run() -> Result<()> {
             if total_leases(&leases) > 0 {
                 idle_since = Instant::now();
             } else if idle_limit > 0 && idle_since.elapsed() >= Duration::from_secs(idle_limit) {
-                eprintln!("idle {idle_limit}s with no leases; exiting");
-                break;
+                // Never exit while a box is still running: we're the only thing
+                // that re-locks it, and exiting would (a) strand a decrypted box
+                // and (b) drop the lease connections of clients still using it,
+                // so the *next* daemon re-locks the box out from under them. If a
+                // box is up but unleased the watchdog will stop it shortly; stay
+                // alive until it actually has.
+                if any_box_running() {
+                    idle_since = Instant::now();
+                } else {
+                    eprintln!("idle {idle_limit}s; exiting");
+                    break;
+                }
             }
             std::thread::sleep(Duration::from_millis(100));
             continue;
@@ -154,24 +178,45 @@ fn incoming(listener: &UnixListener) -> impl Iterator<Item = Option<UnixStream>>
     })
 }
 
+/// Milliseconds since the UNIX epoch, for correlating daemon and proxy logs.
+fn ts() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0)
+}
+
+static CONN_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Handle one client connection until it closes, releasing all its leases.
 fn handle(stream: UnixStream, leases: Leases) -> Result<()> {
+    let id = CONN_ID.fetch_add(1, Ordering::SeqCst);
     let mut writer = stream.try_clone()?;
     let reader = BufReader::new(stream);
     let mut held: HashSet<String> = HashSet::new();
 
     for line in reader.lines() {
-        let line = line?;
+        let line = match line {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("[{}] conn#{id}: read error: {e}", ts());
+                return Err(e.into());
+            }
+        };
         if line.trim().is_empty() {
             continue;
         }
+        // NB: never log `line` — an Acquire request carries the LUKS passphrase.
         let resp = match serde_json::from_str::<Request>(&line) {
             Ok(req) => dispatch(req, &leases, &mut held),
             Err(e) => Response::Error {
                 message: format!("bad request: {e}"),
             },
         };
-        writeln!(writer, "{}", serde_json::to_string(&resp)?)?;
+        if let Err(e) = writeln!(writer, "{}", serde_json::to_string(&resp)?) {
+            eprintln!("[{}] conn#{id}: write error: {e}", ts());
+            return Err(e.into());
+        }
     }
 
     // Connection closed (clean or crash): drop every lease it held.
@@ -223,9 +268,7 @@ fn dispatch(req: Request, leases: &Leases, held: &mut HashSet<String>) -> Respon
 /// SSH control master without a restart.
 fn set_forwards(name: &str, forwards: Vec<Forward>) -> Result<()> {
     for f in &forwards {
-        if f.listen_port == 0 || f.dest_port == 0 {
-            anyhow::bail!("port numbers must be between 1 and 65535");
-        }
+        f.validate()?;
     }
     let mut vm = Vm::load(name)?;
     let old = std::mem::replace(&mut vm.cfg.forwards, forwards.clone());
@@ -271,10 +314,23 @@ fn acquire(leases: &Leases, name: &str, passphrase: &str) -> Result<u16> {
     };
 
     if needs_start {
+        // An ssh-triggered boot (the `potjie proxy` ProxyCommand) has no terminal
+        // to prompt at and sends an empty passphrase: ask the GUI to collect it.
+        let pass = if passphrase.is_empty() {
+            match prompt_passphrase(name) {
+                Ok(p) => p,
+                Err(e) => {
+                    release(leases, name);
+                    return Err(e);
+                }
+            }
+        } else {
+            passphrase.to_string()
+        };
         // Start outside the lock so other requests (status polls, etc.) remain
         // responsive while QEMU launches.
         if let Err(e) = vm
-            .start(passphrase)
+            .start(&pass)
             .with_context(|| format!("starting box '{name}'"))
         {
             // Undo the pre-incremented lease so the box doesn't look leased.
@@ -297,8 +353,43 @@ fn acquire(leases: &Leases, name: &str, passphrase: &str) -> Result<u16> {
     Ok(port)
 }
 
+/// Collect a box's LUKS passphrase via the GUI, for boots triggered by an ssh
+/// connection (the `potjie proxy` ProxyCommand) that have no terminal to prompt
+/// at. Spawns `potjie-gtk --ask-passphrase <box>` and reads the passphrase from
+/// its stdout; a non-zero exit (user cancelled / no display) is an error so the
+/// ssh connection fails cleanly and the box stays locked.
+fn prompt_passphrase(name: &str) -> Result<String> {
+    use std::io::Read;
+    let mut child = std::process::Command::new(potjie_core::tools::potjie_gtk_bin())
+        .arg("--ask-passphrase")
+        .arg(name)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .context("spawning passphrase prompt (potjie-gtk --ask-passphrase)")?;
+    let mut out = String::new();
+    if let Some(mut stdout) = child.stdout.take() {
+        stdout.read_to_string(&mut out).ok();
+    }
+    let status = child.wait().context("waiting for passphrase prompt")?;
+    if !status.success() {
+        anyhow::bail!("passphrase prompt cancelled");
+    }
+    let prefix = potjie_core::tools::ASK_PASSPHRASE_PREFIX;
+    let pass = out
+        .lines()
+        .find_map(|l| l.strip_prefix(prefix))
+        .unwrap_or("")
+        .to_string();
+    if pass.is_empty() {
+        anyhow::bail!("no passphrase entered");
+    }
+    Ok(pass)
+}
+
 /// Regenerate the `potjie-<box>` SSH aliases after any box starts or stops, so
-/// host apps (VS Code Remote-SSH, `ssh potjie-<box>`, …) always resolve.
+/// host tools (`ssh potjie-<box>`, VS Code/Zed Remote-SSH, …) always resolve.
 fn refresh_aliases() {
     if let Err(e) = potjie_core::desktop::sync_ssh_config() {
         eprintln!("ssh alias sync failed: {e}");

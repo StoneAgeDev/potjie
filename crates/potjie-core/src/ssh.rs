@@ -30,7 +30,7 @@ pub fn ensure_keypair(paths: &BoxPaths) -> Result<String> {
         .to_openssh()
         .context("encoding public key")?;
 
-    write_private(&paths.ssh_key, priv_pem.as_bytes())?;
+    crate::paths::write_private(&paths.ssh_key, priv_pem.as_bytes())?;
     std::fs::write(&paths.ssh_pubkey, format!("{pub_line}\n"))
         .with_context(|| format!("writing {}", paths.ssh_pubkey.display()))?;
     Ok(pub_line)
@@ -39,18 +39,6 @@ pub fn ensure_keypair(paths: &BoxPaths) -> Result<String> {
 /// Build an `ssh` command targeting the box on `port`, running `command` if
 /// given (otherwise an interactive login shell).
 pub fn ssh_command(paths: &BoxPaths, username: &str, port: u16, command: Option<&str>) -> Command {
-    ssh_command_opts(paths, username, port, command, false)
-}
-
-/// Like [`ssh_command`], but `x11` enables X forwarding so guest GUI apps render
-/// on the host display — this is how wrapper `.desktop` launchers run guest apps.
-pub fn ssh_command_opts(
-    paths: &BoxPaths,
-    username: &str,
-    port: u16,
-    command: Option<&str>,
-    x11: bool,
-) -> Command {
     let mut cmd = Command::new("ssh");
     cmd.arg("-i")
         .arg(&paths.ssh_key)
@@ -65,32 +53,9 @@ pub fn ssh_command_opts(
         .args(["-o", "StrictHostKeyChecking=no"])
         .args(["-o", "UserKnownHostsFile=/dev/null"])
         .args(["-o", "LogLevel=ERROR"]);
-    if x11 {
-        cmd.arg("-X");
-    }
     cmd.arg(format!("{username}@127.0.0.1"));
     if let Some(c) = command {
         cmd.arg(c);
     }
     cmd
-}
-
-#[cfg(unix)]
-fn write_private(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
-    use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
-    let mut f = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(path)
-        .with_context(|| format!("creating {}", path.display()))?;
-    f.write_all(bytes)?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn write_private(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
-    std::fs::write(path, bytes).with_context(|| format!("creating {}", path.display()))
 }

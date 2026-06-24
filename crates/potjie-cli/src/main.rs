@@ -60,19 +60,17 @@ enum Cmd {
     /// Permanently delete a box.
     Rm { name: String },
 
-    /// Internal: run a shell command and wait for its whole descendant tree to
-    /// exit (used by host-app wrappers so the box stays up for the app's *real*
-    /// lifetime, not just until a launcher process forks and returns).
-    #[command(name = "__run-tracked", hide = true)]
-    RunTracked {
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
-        command: Vec<String>,
-    },
-
     /// Internal: run the guard daemon. Auto-spawned (detached) by the first
     /// client that needs it; not meant to be invoked by hand.
     #[command(name = "daemon", hide = true)]
     Daemon,
+
+    /// Internal: SSH `ProxyCommand`. Leases the box (booting it, and prompting the
+    /// passphrase via the GUI when it's locked), then pipes stdin/stdout to the
+    /// box's sshd — so `ssh potjie-<box>` boots the box on connect and re-locks it
+    /// on disconnect. Wired into the managed ssh config; not invoked by hand.
+    #[command(name = "proxy", hide = true)]
+    Proxy { name: String },
 }
 
 #[derive(Subcommand)]
@@ -114,9 +112,75 @@ fn main() -> Result<()> {
         Cmd::Verify { name } => verify(&name),
         Cmd::Forward { action } => forward(action),
         Cmd::Rm { name } => rm(&name),
-        Cmd::RunTracked { command } => run_tracked(&command),
         Cmd::Daemon => potjie_daemon::run(),
+        Cmd::Proxy { name } => proxy(&name),
     }
+}
+
+/// SSH `ProxyCommand` body: lease the box (the daemon boots it, prompting the
+/// passphrase via the GUI if it's locked), then splice this process's
+/// stdin/stdout onto the box's sshd over a plain TCP socket. The outer `ssh`
+/// speaks the SSH protocol across that splice. When the session ends the splice
+/// closes, we drop the lease, and the daemon re-locks the box.
+///
+/// Nothing may be written to stdout except the proxied bytes (it *is* the ssh
+/// channel), so all diagnostics go to stderr.
+fn proxy(name: &str) -> Result<()> {
+    use std::net::{Shutdown, TcpStream};
+    use std::os::unix::io::FromRawFd;
+    // One line of feedback: an ssh connect can pause here for ~15s while the box
+    // boots (and the GUI prompts for the passphrase). Empty passphrase: an
+    // ssh-triggered boot has no terminal, so the daemon collects it via the GUI.
+    eprintln!("potjie: connecting to '{name}' (booting it if needed)…");
+    let lease = guard::acquire(name, "").with_context(|| format!("leasing box '{name}'"))?;
+    let port = lease.ssh_port;
+    let server = TcpStream::connect(("127.0.0.1", port))
+        .with_context(|| format!("connecting to box ssh at 127.0.0.1:{port}"))?;
+
+    // Splice fd 0/1 (the socketpair ssh gave the ProxyCommand) onto the box
+    // socket. Use the raw fds directly: std::io::stdout() is a LineWriter, which
+    // would stall the binary SSH stream (no newlines to flush on). std `File` is
+    // unbuffered. These own the fds and close them on drop, which is fine — the
+    // process exits immediately after.
+    let sin = unsafe { std::fs::File::from_raw_fd(0) };
+    let sout = unsafe { std::fs::File::from_raw_fd(1) };
+
+    // stdin -> box on a worker thread; box -> stdout on this one.
+    let mut server_w = server.try_clone().context("cloning box stream")?;
+    std::thread::spawn(move || {
+        let _ = pump(sin, &mut server_w);
+        let _ = server_w.shutdown(Shutdown::Write);
+    });
+    // Returns when the box closes the connection (remote shell exited / dropped).
+    let _ = pump(&server, sout);
+
+    drop(lease); // release → daemon re-locks the box if this was the last session
+    Ok(())
+}
+
+/// Stream `r` → `w` chunk by chunk until EOF, returning the bytes copied.
+///
+/// Deliberately *not* `std::io::copy`: on Linux that special-cases File/socket
+/// descriptors into a `splice(2)`/`sendfile(2)` kernel fast path, and routing
+/// the ssh `ProxyCommand` socketpair fds (wrapped as `File`) through it against
+/// the box socket deadlocks the SSH handshake — the server's banner never
+/// reaches the client, so sshd drops the session at `LoginGraceTime` (~120s).
+/// A plain read/write loop forwards every chunk immediately, which is what the
+/// interactive binary protocol needs.
+fn pump(mut r: impl std::io::Read, mut w: impl std::io::Write) -> std::io::Result<u64> {
+    let mut buf = [0u8; 32 * 1024];
+    let mut total = 0u64;
+    loop {
+        let n = match r.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
+        w.write_all(&buf[..n])?;
+        total += n as u64;
+    }
+    Ok(total)
 }
 
 fn verify(name: &str) -> Result<()> {
@@ -134,16 +198,6 @@ fn verify(name: &str) -> Result<()> {
         println!("\n\u{2717} NOT SEALED — see the checks above.");
         std::process::exit(1);
     }
-}
-
-/// Run a shell command, blocking until its entire descendant tree exits.
-fn run_tracked(command: &[String]) -> Result<()> {
-    let joined = command.join(" ");
-    let mut cmd = std::process::Command::new("sh");
-    cmd.arg("-c").arg(&joined);
-    let code = potjie_core::proc::run_until_descendants_exit(cmd)
-        .context("running tracked command")?;
-    std::process::exit(code);
 }
 
 /// Prompt for the LUKS passphrase, or read `POTJIE_PASSPHRASE` for scripting.
@@ -192,6 +246,9 @@ fn create(name: &str, cpus: u32, memory: u32, disk: u32) -> Result<()> {
         }
     })?;
     eprintln!();
+    // Write the `potjie-<box>` ssh alias now so `ssh potjie-<name>` resolves (and
+    // can boot the box on demand) without first having to start the daemon.
+    let _ = potjie_core::desktop::sync_ssh_config();
     println!("Box '{name}' created. Start a shell with: potjie ssh {name}");
     Ok(())
 }
@@ -396,9 +453,6 @@ fn forward(action: ForwardCmd) -> Result<()> {
             Ok(())
         }
         ForwardCmd::Add { name, listen_port, dest_port, host, remote, label } => {
-            if listen_port == 0 || dest_port == 0 {
-                anyhow::bail!("ports must be between 1 and 65535");
-            }
             let fwd = Forward {
                 direction: if remote {
                     ForwardDirection::Remote
@@ -410,6 +464,7 @@ fn forward(action: ForwardCmd) -> Result<()> {
                 dest_port,
                 label,
             };
+            fwd.validate()?;
             let mut fwds = guard::get_forwards(&name)?;
             if fwds.contains(&fwd) {
                 anyhow::bail!("that forward already exists");

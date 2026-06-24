@@ -73,11 +73,6 @@ pub fn blockdev_args(disk: &Path, secret: &SecretFile, node_name: &str) -> (Stri
     (secret.object_arg(SECRET_ID), blockdev)
 }
 
-/// The shared secret id used across disk operations and boot.
-pub fn secret_id() -> &'static str {
-    SECRET_ID
-}
-
 /// Inspect the *on-disk* image (no key needed — this reads only metadata) and
 /// report whether its payload is LUKS-encrypted. Used as one half of the
 /// decryption assurance: the disk is provably encrypted at rest.

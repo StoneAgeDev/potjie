@@ -13,6 +13,54 @@ running/decrypted **only while a trusted app holds it open**.
 Status: **working proof-of-concept, verified end-to-end** (2026-06-17).
 Networking reverted to slirp + opt-in SSH port forwards 2026-06-19 (passt removed).
 
+**Review-driven cleanup 2026-06-23** (security + dead code + scope cut):
+- **Security:** the daemon no longer logs the request line (it carried the LUKS
+  passphrase in an `Acquire`); all the noisy per-request/lease-map `eprintln!`
+  debug instrumentation in the daemon and the `proxy` ProxyCommand is gone.
+- **Flatpak:** `--socket=x11` → `--socket=fallback-x11` (X11 only when Wayland is
+  absent — removes the unrestricted-X11 finding while keeping the GUI usable on
+  X11 desktops). `~/.ssh/config:ro` and `--share=network` retained (both needed).
+- **Removed guest-app wrappers entirely** (no strong need; lets us drop X11): the
+  DynamicLauncher registry/portal code in `desktop.rs`, the GUI **Apps** tab and
+  its helpers, `potjie-gtk --launch` mode, `Vm::list_guest_apps`/`ssh_command_x11`,
+  the `__run-tracked` subcommand + `proc.rs` (child-subreaper), and the `ashpd` +
+  `tokio` deps. SSH-config/alias machinery in `desktop.rs` stays.
+- **Dead code:** `verify_decrypted`/`DecryptionProof`, `disk::secret_id`,
+  `base::ensure_default_base`, `guard::daemon_running`, unused `thiserror` dep.
+- **DRY:** the duplicated 0600 `write_private` (secret.rs/ssh.rs/desktop.rs) now
+  lives once in `paths::write_private`.
+- Net ~1600 lines removed; workspace builds clean (no warnings), Shell tab index
+  fixed to 2 after dropping Apps. NB: `flatpak/cargo-sources.json` is now a
+  superset (still builds offline); regenerate it when convenient.
+
+**Daemon/box desync — FIXED 2026-06-23** (sealing-guarantee bug): a box could
+keep running (qemu decrypting the disk) while the daemon reported it *stopped* —
+gray dot, "stopped" notification, and `potjie down` unable to re-lock it. Two
+causes, two fixes:
+- **Idle-exit stranded running boxes.** The daemon idle-exits after 90s with zero
+  leases, but Zed/VS Code keep their long-lived traffic on the `potjie-fwd-<box>`
+  forward master, which holds *no* lease — so leases legitimately read 0 while a
+  box is in active use. The idle-exit (and its `shutdown → lock all boxes`) then
+  fired, and each restart broke live `potjie proxy` lease connections, so the next
+  daemon saw the still-running box as unleased and re-locked it. Fix: the daemon
+  now refuses to idle-exit while `any_box_running()` (`daemon/lib.rs`).
+- **Status trusted only the pidfile.** A `stop` that removed the pidfile without
+  actually killing qemu (a cross-restart race) left every later `status()` reading
+  "stopped" while qemu lived on. Fix: `qemu::status` falls back to a `/proc` scan
+  (`box_process_pid`, matched on the unique `-name potjie-<box>` arg) when the
+  pidfile is missing/dead — so a live box can never ghost, and `stop`/`down` can
+  find and kill it. Confirmed via `/proc/<pid>/ns/pid`: daemon and its qemu share
+  a PID namespace, so signalling works once status reports the real pid.
+- **The GUI read status from the wrong sandbox.** The overview/sidebar called
+  `Vm::status()` *directly*, but the GUI is a separate `flatpak run` instance with
+  its own PID namespace and private `$XDG_RUNTIME_DIR` — it can see neither the
+  daemon's qemu nor its pidfile, so it always rendered "stopped" even with a box
+  live (and Zed working in it). Fix: GUI status now goes through the daemon
+  (`box_status` → `guard::status`, poller → `guard::list`), the single source of
+  truth that lives with qemu. Side benefit: this is the ~1/s poll the daemon's
+  idle-exit comment always *assumed* the GUI made but it never actually did — so
+  the daemon now genuinely stays warm while the app is open.
+
 ---
 
 ## The flow (as built)
@@ -632,16 +680,80 @@ launches GTK on CachyOS (non-NixOS, no host /nix). Notes:
       (ProxyCommand-as-lease over the shared `~/.potjie` daemon socket; daemon spawns a
       passphrase window on connect; re-lock on disconnect) — needs no new permissions;
       not yet built.
-- [ ] **SSH-connection-tied lifecycle (host-tool access, Flathub-clean)**: box boots
-      when host ssh/Zed connects to `potjie-<box>` and re-locks when the last session
-      drops. Pieces: ProxyCommand in the managed ssh fragment that holds the lease over
-      a host-visible daemon socket under `~/.potjie`; daemon-spawned `potjie-gtk
-      --ask-passphrase` prompt on a locked box (the one deliberate floating-window
-      exception, since the trigger is an ssh connect with no inline surface). Open
-      verification first: host ssh can reach `potjie-<box>` end-to-end (the fragment's
-      `ControlPath` currently points at the sandbox-private runtime dir and will need
-      relocating), and the ProxyCommand's host-tool dependency (`socat`/`nc` vs a tiny
-      helper).
+- [x] **SSH-connection-tied lifecycle — `ssh potjie-<box>` from zero to shell
+      (2026-06-21, built; live end-to-end test pending)**. `ssh potjie-<box>` now boots
+      the box on connect and re-locks it when the last session drops — same
+      "decrypted only while in use" guarantee as the Shell tab, driven by the ssh
+      session, no host-spawn. Pieces:
+  - **`potjie proxy <box>`** (hidden CLI subcommand) is the ssh **`ProxyCommand`**:
+    it leases the box via the daemon (empty passphrase → daemon prompts), then
+    splices stdin/stdout onto the box's sshd over a plain TCP socket to
+    `127.0.0.1:<port>`. The outer `ssh` speaks SSH across that splice. Session ends
+    → splice closes → lease drops → daemon re-locks. (Nothing but proxied bytes may
+    touch stdout — it *is* the ssh channel — so all diagnostics go to stderr.)
+  - **Daemon-spawned passphrase prompt.** `daemon::acquire` with an empty passphrase
+    on a locked box spawns **`potjie-gtk --ask-passphrase <box>`** (the daemon is
+    headless / doesn't link GTK, so it execs its GUI sibling), reads the passphrase
+    from the prompt's stdout (sentinel-prefixed via `tools::ASK_PASSPHRASE_PREFIX` so
+    GTK stdout noise can't confuse it), then boots. Cancel/close → non-zero exit →
+    the ssh connection fails cleanly and the box stays locked. This is the **one
+    deliberate standalone-window exception** to the no-floating-windows rule (the
+    trigger is an ssh connect with no inline surface).
+  - **Two ssh aliases per box** (`desktop::sync_ssh_config`): host-facing
+    `potjie-<box>` (emitted for *every* box, running or not, carrying the
+    `ProxyCommand`; no port — the proxy learns it live) and direct `potjie-fwd-<box>`
+    (running boxes only; used by the daemon's forward control master, no
+    ProxyCommand so it never takes a lease, carries the port forwards).
+    `forward::alias` now points the master at `potjie-fwd-<box>`. The daemon writes
+    the fragment at startup too, so the alias exists before any box runs; `potjie
+    create` also writes it. The `ProxyCommand` is `flatpak run --command=potjie
+    com.potjie.Potjie proxy <box>` inside a Flatpak, else `<potjie> proxy <box>`.
+  - **Native verified statically**: `potjie list` regenerates the fragment with the
+    `potjie-<box>` ProxyCommand block while the box is *stopped*; `~/.ssh/config`
+    Include present. Live `ssh potjie-test` (passphrase window → boot → shell →
+    re-lock on exit) is the remaining manual check.
+  - **proxy splice deadlock — FIXED**: `ssh potjie-<box>` connected, booted, then
+    hung and dropped after ~120s having moved only the box's 1081-byte opening
+    flight. Root cause: `proxy()` spliced the ssh `ProxyCommand` socketpair fds
+    (wrapped as `std::fs::File`) to the box socket with `std::io::copy`, which on
+    Linux takes a `splice(2)`/`sendfile(2)` kernel fast path for File/socket fds and
+    stalls the handshake — the server banner never reaches the client, so sshd kills
+    the session at `LoginGraceTime`. Reproduced standalone (no flatpak, no VM): the
+    same `std::io::copy` splice against a throwaway sshd deadlocks; a plain userspace
+    read/write loop completes the handshake. Fix: replaced both copies with a `pump`
+    read/write loop (`crates/potjie-cli/src/main.rs`). Not flatpak-related — flatpak
+    stdio proved bidirectional + real-time in isolation.
+  - **Flatpak follow-up (not done)**: the daemon's lease socket is still under the
+    sandbox-private `$XDG_RUNTIME_DIR`; a second `flatpak run … proxy` instance may
+    not share it. Move the lease socket under home-shared `~/.potjie/run/` so the
+    host-spawned proxy instance can always reach the daemon.
+- [x] **Codebase review cleanup (2026-06-24)**. AppImage fully removed (the nix-
+      bundle route is dead): deleted the dangling `flatpak/potjie-gtk.AppImage` and
+      root `potjie-gtk.AppImage` symlinks into `/nix/store`, scrubbed the AppImage
+      mentions in `tools.rs`/`main.rs` doc comments, gitignored `*.AppImage` +
+      `flatpak/build.log`. Removed dead code: `SecretFile::path()` and
+      `ForwardDirection::as_str()` (no callers). **Security hardening**: box names
+      off the daemon wire are now validated in `BoxPaths::new` (moved `validate_name`
+      to `paths.rs`) so an `Acquire`/`Rm`/`Status` with `../…` can't path-traverse;
+      and `SecretFile::new` now refuses to write the LUKS key unless the runtime dir
+      is provably tmpfs/ramfs (`paths::is_tmpfs` via `statfs` magic) — fail closed
+      rather than leak plaintext key bytes onto persistent storage. UX: base-image
+      download now retries 3× (it already wrote to a `.part` temp + renamed on
+      success).
+- [x] **Review follow-up pass — UI split + DRY (2026-06-24)**. Split the
+      1484-line `crates/potjie-gtk/src/ui/mod.rs` into per-concern modules: `mod.rs`
+      (633 lines: shared helpers + `Confirm` + main window + ssh gate + sidebar
+      poller), `create.rs` (new-box form), `detail.rs` (notebook + lifecycle wiring),
+      `overview.rs`, `ports.rs`, `shell.rs` (+ `ShellCtl`). Submodules reach shared
+      helpers via `super::` (Rust lets child modules see ancestor privates); cross-
+      module tab builders are `pub(super)`. Note: `clone!` with a `#[weak]` binding
+      expands to reference `glib::`, so any module using that form needs `use
+      gtk::glib;` (ports.rs). DRY: `tools::resolve_sibling(env, name)` now backs both
+      `potjie_bin`/`potjie_gtk_bin`; `Forward::validate()` is the single port-zero
+      check (CLI + daemon); `desktop::identity_lines(user, key)` emits the shared
+      `User`/`IdentityFile`/host-key lines for both managed `Host` blocks. Workspace
+      builds clean, no new clippy warnings (the remaining "very complex type" ones
+      are the pre-existing `Rc<RefCell<Option<Box<dyn Fn()>>>>` sidebar-refresh types).
 - [ ] Harden: QMP-based status/port (vs
       pidfile), daemon socket peer-cred check, resize/clone/snapshot, per-box
       port-forward config beyond SSH, error surfacing/toasts

@@ -15,13 +15,6 @@ pub enum ForwardDirection {
 }
 
 impl ForwardDirection {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Local => "local",
-            Self::Remote => "remote",
-        }
-    }
-
     /// The `ssh` command-line flag for this direction (`-L` / `-R`), shared by the
     /// live `ssh -O forward`/`-O cancel` control requests.
     pub fn flag(self) -> &'static str {
@@ -63,6 +56,16 @@ pub struct Forward {
 }
 
 impl Forward {
+    /// Reject a forward with a zero port (clap already bounds the rest of the `u16`
+    /// range, so 0 is the only invalid value). Shared by the CLI and the daemon so
+    /// the same rule guards every path that persists a forward.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if self.listen_port == 0 || self.dest_port == 0 {
+            anyhow::bail!("port numbers must be between 1 and 65535");
+        }
+        Ok(())
+    }
+
     /// Build a forward from the plain "host port / box port" framing the UI speaks,
     /// hiding the SSH listen-vs-destination asymmetry (which side listens depends on
     /// the direction). For `Local` (host→box) the host listens and the box is the

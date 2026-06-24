@@ -47,8 +47,72 @@ pub fn img_dir() -> Result<PathBuf> {
 pub fn runtime_root() -> Result<PathBuf> {
     let base = std::env::var_os("XDG_RUNTIME_DIR")
         .map(PathBuf::from)
-        .unwrap_or_else(|| std::env::temp_dir());
+        .unwrap_or_else(std::env::temp_dir);
     Ok(base.join("potjie"))
+}
+
+/// True if we're running inside a Flatpak sandbox.
+pub fn in_flatpak() -> bool {
+    Path::new("/.flatpak-info").exists()
+}
+
+/// True if `path` lives on a RAM-backed filesystem (tmpfs or ramfs), so anything
+/// written there never reaches persistent storage. Used to guard LUKS key
+/// material before it's written. On non-Linux we can't cheaply tell, so we
+/// optimistically return `true` rather than block the app.
+#[cfg(target_os = "linux")]
+pub fn is_tmpfs(path: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    const TMPFS_MAGIC: i64 = 0x0102_1994;
+    const RAMFS_MAGIC: i64 = 0x8584_58f6;
+    let Ok(c_path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+        return false;
+    };
+    let mut buf: libc::statfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statfs(c_path.as_ptr(), &mut buf) } != 0 {
+        return false;
+    }
+    let ty = buf.f_type as i64;
+    ty == TMPFS_MAGIC || ty == RAMFS_MAGIC
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn is_tmpfs(_path: &Path) -> bool {
+    true
+}
+
+/// Validate a box name: it becomes a directory name *and* a host hostname, and is
+/// taken straight off the wire by the daemon — so reject anything that could path-
+/// traverse (`..`, `/`) or make an invalid hostname.
+pub fn validate_name(name: &str) -> Result<()> {
+    if name.is_empty() || name.len() > 63 {
+        anyhow::bail!("box name must be 1..=63 characters");
+    }
+    if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+        anyhow::bail!("box name may only contain ASCII letters, digits and '-'");
+    }
+    if name.starts_with('-') || name.ends_with('-') {
+        anyhow::bail!("box name must not start or end with '-'");
+    }
+    Ok(())
+}
+
+/// Directory holding the daemon's control socket.
+///
+/// Under Flatpak this **must** be shared across app instances: the GUI and each
+/// `flatpak run … proxy` ProxyCommand run in *separate* sandbox instances with
+/// their own private `$XDG_RUNTIME_DIR`, so a socket there would give every
+/// instance its *own* daemon — and two daemons fighting over the (shared on-disk)
+/// box disk produces a qcow2 write-lock error. `~/.potjie/run` is on the shared
+/// home, identical in every instance and on the host. Only the socket goes here;
+/// secrets and pidfiles stay on the tmpfs `runtime_root`, owned by the single
+/// daemon that actually spawns qemu. Native keeps the socket on tmpfs too.
+pub fn control_dir() -> Result<PathBuf> {
+    if in_flatpak() {
+        Ok(root()?.join("run"))
+    } else {
+        runtime_root()
+    }
 }
 
 /// Resolved set of paths for a single box.
@@ -69,6 +133,7 @@ pub struct BoxPaths {
 
 impl BoxPaths {
     pub fn new(name: &str) -> Result<Self> {
+        validate_name(name)?;
         let dir = img_dir()?.join(name);
         let runtime_dir = runtime_root()?.join(name);
         Ok(Self {
@@ -102,6 +167,7 @@ pub fn ensure_layout() -> Result<()> {
     create_private_dir(&base_dir()?)?;
     create_private_dir(&img_dir()?)?;
     create_private_dir(&runtime_root()?)?;
+    create_private_dir(&control_dir()?)?;
     Ok(())
 }
 
@@ -125,4 +191,27 @@ fn set_private(path: &Path) -> Result<()> {
 #[cfg(not(unix))]
 fn set_private(_path: &Path) -> Result<()> {
     Ok(())
+}
+
+/// Write `bytes` to `path` as an owner-only (0600) file, truncating any existing
+/// content. The single home for the "private file" pattern used for secrets, ssh
+/// keys, and the managed ssh config.
+#[cfg(unix)]
+pub fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)
+        .with_context(|| format!("writing {}", path.display()))?;
+    f.write_all(bytes)?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+pub fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
+    std::fs::write(path, bytes).with_context(|| format!("writing {}", path.display()))
 }
