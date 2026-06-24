@@ -1,6 +1,6 @@
 [Desktop Entry]
 Name=Potjie
-Comment=Encrypted virtual machine manager
+Comment=Plug-and-play secure dev boxes
 Exec=potjie-gtk
 Icon=com.potjie.Potjie
 Type=Application

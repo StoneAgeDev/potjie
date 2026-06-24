@@ -5,7 +5,7 @@
   <project_license>MIT</project_license>
 
   <name>Potjie</name>
-  <summary>Encrypted virtual machine manager</summary>
+  <summary>Plug-and-play secure dev boxes</summary>
 
   <developer id="com.potjie">
     <name>StoneAgeDev</name>
