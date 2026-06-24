@@ -8,7 +8,7 @@
   <summary>Encrypted virtual machine manager</summary>
 
   <developer id="com.potjie">
-    <name>Potjie contributors</name>
+    <name>StoneAgeDev</name>
   </developer>
 
   <description>
@@ -31,8 +31,8 @@
 
   <launchable type="desktop-id">com.potjie.Potjie.desktop</launchable>
 
-  <url type="homepage">https://github.com/potjie/potjie</url>
-  <url type="bugtracker">https://github.com/potjie/potjie/issues</url>
+  <url type="homepage">https://github.com/StoneAgeDev/potjie</url>
+  <url type="bugtracker">https://github.com/StoneAgeDev/potjie/issues</url>
 
   <releases>
     <release version="0.1.0" date="2026-06-20">

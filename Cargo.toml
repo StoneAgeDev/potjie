@@ -11,8 +11,8 @@ members = [
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
-authors = ["potjie contributors"]
-repository = "https://example.com/potjie"
+authors = ["StoneAgeDev"]
+repository = "https://github.com/StoneAgeDev/potjie"
 
 [workspace.dependencies]
 anyhow = "1"

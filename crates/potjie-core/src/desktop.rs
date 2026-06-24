@@ -67,6 +67,7 @@ pub fn sync_ssh_config() -> Result<()> {
 \tHostName {name}\n\
 {identity}\
 \tSetEnv TERM=xterm-256color\n\
+\tConnectTimeout 180\n\
 \tProxyCommand {proxy_cmd} {name}\n",
             name = vm.cfg.name,
         ));

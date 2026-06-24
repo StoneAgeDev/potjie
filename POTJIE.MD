@@ -363,8 +363,8 @@ other code.
 - **Crash safety:** `kill -9` on a holder re-locks the box within seconds. ✅
 - GTK4 app launches and runs its main loop under Wayland. ✅
 
-Leftover test artifact: a box named **`spike`** exists under `~/.potjie/img/spike`
-(passphrase `spiketest`). Delete with `potjie rm spike` if unwanted.
+Leftover test artifact: a box named **`spike`** may exist under `~/.potjie/img/spike`.
+Delete with `potjie rm spike` if unwanted.
 
 ---
 
