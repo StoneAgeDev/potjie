@@ -1,13 +1,13 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <component type="desktop-application">
-  <id>com.potjie.Potjie</id>
+  <id>io.github.StoneAgeDev.potjie</id>
   <metadata_license>CC0-1.0</metadata_license>
   <project_license>MIT</project_license>
 
   <name>Potjie</name>
   <summary>Plug-and-play secure dev boxes</summary>
 
-  <developer id="com.potjie">
+  <developer id="io.github.StoneAgeDev">
     <name>StoneAgeDev</name>
   </developer>
 
@@ -29,7 +29,7 @@
     </ul>
   </description>
 
-  <launchable type="desktop-id">com.potjie.Potjie.desktop</launchable>
+  <launchable type="desktop-id">io.github.StoneAgeDev.potjie.desktop</launchable>
 
   <url type="homepage">https://github.com/StoneAgeDev/potjie</url>
   <url type="bugtracker">https://github.com/StoneAgeDev/potjie/issues</url>

@@ -2,9 +2,9 @@
 Name=Potjie
 Comment=Plug-and-play secure dev boxes
 Exec=potjie-gtk
-Icon=com.potjie.Potjie
+Icon=io.github.StoneAgeDev.potjie
 Type=Application
 Categories=System;Emulator;
 Keywords=virtual machine;VM;encrypted;LUKS;developer;sandbox;
-StartupWMClass=com.potjie.Potjie
+StartupWMClass=io.github.StoneAgeDev.potjie
 X-GNOME-UsesNotifications=true
