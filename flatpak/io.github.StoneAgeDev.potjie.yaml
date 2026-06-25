@@ -186,7 +186,7 @@ modules:
       - type: git
         url: https://github.com/StoneAgeDev/potjie.git
         tag: v0.1.0
-        commit: 02a68d384923eeb8ddf5d7ea4daad21735b0ee6b
+        commit: 05e5847fbfd82a3a9968436af4f2d1ed3f0f24a4
       # Generated from Cargo.lock — regenerate when Cargo.lock changes:
       #   python3 flatpak-cargo-generator.py ../Cargo.lock -o cargo-sources.json
       - cargo-sources.json
