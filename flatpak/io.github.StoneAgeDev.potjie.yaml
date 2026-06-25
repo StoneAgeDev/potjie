@@ -1,4 +1,4 @@
-app-id: com.potjie.Potjie
+app-id: io.github.StoneAgeDev.potjie
 runtime: org.gnome.Platform
 runtime-version: '50'
 sdk: org.gnome.Sdk
@@ -46,6 +46,42 @@ build-options:
     CARGO_NET_OFFLINE: 'true'
 
 modules:
+  # Unicode validation library required by vte 0.82+.
+  - name: simdutf
+    buildsystem: cmake-ninja
+    config-opts:
+      - -DSIMDUTF_TESTS=OFF
+      - -DSIMDUTF_BENCHMARKS=OFF
+      - -DSIMDUTF_TOOLS=OFF
+    sources:
+      - type: git
+        url: https://github.com/simdutf/simdutf.git
+        tag: v8.2.0
+        commit: fd476229424b40ae71a58dd5a205795c3d76b5f1
+        x-checker-data:
+          type: json
+          url: https://api.github.com/repos/simdutf/simdutf/releases/latest
+          tag-query: .tag_name
+          version-query: .tag_name | ltrimstr("v")
+          timestamp-query: .published_at
+
+  # Fast float parsing library required by vte 0.82+.
+  - name: fast_float
+    buildsystem: cmake-ninja
+    config-opts:
+      - -DFASTFLOAT_TESTS=OFF
+    sources:
+      - type: git
+        url: https://github.com/fastfloat/fast_float.git
+        tag: v6.1.1
+        commit: f476bc713fda06fbd34dc621b466745a574b3d4c
+        x-checker-data:
+          type: json
+          url: https://api.github.com/repos/fastfloat/fast_float/releases/latest
+          tag-query: .tag_name
+          version-query: .tag_name | ltrimstr("v")
+          timestamp-query: .published_at
+
   # Embedded terminal widget for the in-window shell.
   - name: vte
     buildsystem: meson
@@ -56,8 +92,14 @@ modules:
     sources:
       - type: git
         url: https://gitlab.gnome.org/GNOME/vte.git
-        tag: 0.78.3
-        commit: 16a8b206dfa4631b1db83229b09c90f37d8748b3
+        tag: 0.82.1
+        commit: aa9b69140f48a019ccc72a3a27a1ddd85b9622ed
+        x-checker-data:
+          type: json
+          url: https://gitlab.gnome.org/api/v4/projects/GNOME%2Fvte/releases?per_page=10
+          tag-query: map(select(.tag_name | test("^[0-9]+\\.[0-9]*[02468]\\."))) | first | .tag_name
+          version-query: map(select(.tag_name | test("^[0-9]+\\.[0-9]*[02468]\\."))) | first | .tag_name
+          timestamp-query: map(select(.tag_name | test("^[0-9]+\\.[0-9]*[02468]\\."))) | first | .released_at
 
   # User-mode (slirp) networking backend for the bundled qemu.
   - name: libslirp
@@ -67,6 +109,12 @@ modules:
         url: https://gitlab.freedesktop.org/slirp/libslirp.git
         tag: v4.9.3
         commit: dd76415fce457e319d665eb8210d05c5731360ba
+        x-checker-data:
+          type: json
+          url: https://gitlab.freedesktop.org/api/v4/projects/slirp%2Flibslirp/releases?per_page=5
+          tag-query: first | .tag_name
+          version-query: first | .tag_name | ltrimstr("v")
+          timestamp-query: first | .released_at
 
   # Bundled qemu so nothing reaches out to the host (Flathub-friendly). Only the
   # x86_64 system target + tools (qemu-img) are built; the release tarball ships
@@ -74,10 +122,9 @@ modules:
   - name: qemu
     buildsystem: simple
     build-commands:
-      # --disable-fdt: q35 needs no device tree, and dtc is the one subproject the
-      #   release tarball doesn't bundle. --disable-download: forbid meson from
-      #   git-fetching subprojects (no network in the build sandbox); everything
-      #   else qemu needs is bundled in the tarball.
+      # --disable-fdt: q35 needs no device tree, and dtc is not in the tarball.
+      # --disable-download: forbid meson from fetching subprojects at build time;
+      #   firmware blobs (SeaBIOS, iPXE, SLOF) are pre-built in the release tarball.
       - ./configure --prefix=/app --target-list=x86_64-softmmu --enable-kvm
         --enable-slirp --disable-fdt --disable-download --disable-docs
         --disable-gtk --disable-sdl --disable-vnc --disable-spice --disable-opengl
@@ -90,21 +137,33 @@ modules:
       - type: archive
         url: https://download.qemu.org/qemu-11.0.1.tar.xz
         sha256: 0d235f5820278d914a3155ec27af8e4258d697ea892895570807d69c0cb8cd64
+        x-checker-data:
+          type: anitya
+          project-id: 9820
+          url-template: https://download.qemu.org/qemu-$version.tar.xz
 
   # Bundled OpenSSH client (the GNOME runtime has no ssh). Only the client
   # binaries Potjie drives are installed; the server/host-key install is skipped.
   - name: openssh
     buildsystem: simple
     build-commands:
+      - autoreconf -fi
       - ./configure --prefix=/app --sysconfdir=/app/etc/ssh
         --with-privsep-path=/app/var/empty --without-pam
       - make -j$(nproc) ssh ssh-keygen
       - install -Dm755 ssh /app/bin/ssh
       - install -Dm755 ssh-keygen /app/bin/ssh-keygen
     sources:
-      - type: archive
-        url: https://cdn.openbsd.org/pub/OpenBSD/OpenSSH/portable/openssh-10.3p1.tar.gz
-        sha256: 56682a36bb92dcf4b4f016fd8ec8e74059b79a8de25c15d670d731e7d18e45f4
+      - type: git
+        url: https://github.com/openssh/openssh-portable.git
+        tag: V_10_3_P1
+        commit: 2d98db98331803cbb820211b2fb0d31a6e71e58e
+        x-checker-data:
+          type: json
+          url: https://api.github.com/repos/openssh/openssh-portable/releases/latest
+          tag-query: .tag_name
+          version-query: .tag_name | gsub("_"; ".") | ltrimstr("V.")
+          timestamp-query: .published_at
 
   - name: potjie
     buildsystem: simple
@@ -112,17 +171,17 @@ modules:
       - cargo --offline build --release
       - install -Dm755 target/release/potjie     /app/bin/potjie
       - install -Dm755 target/release/potjie-gtk /app/bin/potjie-gtk
-      - install -Dm644 flatpak/com.potjie.Potjie.desktop
-                       /app/share/applications/com.potjie.Potjie.desktop
-      - install -Dm644 flatpak/com.potjie.Potjie.metainfo.xml
-                       /app/share/metainfo/com.potjie.Potjie.metainfo.xml
+      - install -Dm644 flatpak/io.github.StoneAgeDev.potjie.desktop
+                       /app/share/applications/io.github.StoneAgeDev.potjie.desktop
+      - install -Dm644 flatpak/io.github.StoneAgeDev.potjie.metainfo.xml
+                       /app/share/metainfo/io.github.StoneAgeDev.potjie.metainfo.xml
       # Icon: scalable SVG + key PNG sizes required by Flathub
       - install -Dm644 icons/potjie.svg
-                       /app/share/icons/hicolor/scalable/apps/com.potjie.Potjie.svg
+                       /app/share/icons/hicolor/scalable/apps/io.github.StoneAgeDev.potjie.svg
       - install -Dm644 icons/potjie-128.png
-                       /app/share/icons/hicolor/128x128/apps/com.potjie.Potjie.png
+                       /app/share/icons/hicolor/128x128/apps/io.github.StoneAgeDev.potjie.png
       - install -Dm644 icons/potjie-256.png
-                       /app/share/icons/hicolor/256x256/apps/com.potjie.Potjie.png
+                       /app/share/icons/hicolor/256x256/apps/io.github.StoneAgeDev.potjie.png
     sources:
       - type: dir
         path: ..

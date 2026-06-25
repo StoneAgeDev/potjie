@@ -35,7 +35,7 @@ pub fn ask_passphrase(app: &adw::Application, box_name: &str) {
     dialog.connect_response(None, clone!(
         #[strong] entry,
         move |_, response| {
-            drop(&hold);
+            drop(hold);
             if response == "unlock" {
                 let pass = entry.text().to_string();
                 if pass.is_empty() {
