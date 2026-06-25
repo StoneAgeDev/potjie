@@ -1,0 +1,23 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+jobs:
+  flatpak:
+    runs-on: ubuntu-latest
+    container:
+      image: bilelmoussaoui/flatpak-github-actions:gnome-50
+      options: --privileged
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: bilelmoussaoui/flatpak-github-actions/flatpak-builder@v6
+        with:
+          bundle: io.github.StoneAgeDev.potjie.flatpak
+          manifest-path: flatpak/io.github.StoneAgeDev.potjie.yaml
+          cache-key: flatpak-builder-${{ hashFiles('flatpak/io.github.StoneAgeDev.potjie.yaml') }}
+          upload-artifact: false

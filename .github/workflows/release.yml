@@ -1,0 +1,25 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  flatpak:
+    runs-on: ubuntu-latest
+    container:
+      image: bilelmoussaoui/flatpak-github-actions:gnome-50
+      options: --privileged
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: bilelmoussaoui/flatpak-github-actions/flatpak-builder@v6
+        with:
+          bundle: io.github.StoneAgeDev.potjie.flatpak
+          manifest-path: flatpak/io.github.StoneAgeDev.potjie.yaml
+          cache-key: flatpak-builder-${{ hashFiles('flatpak/io.github.StoneAgeDev.potjie.yaml') }}
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: io.github.StoneAgeDev.potjie.flatpak

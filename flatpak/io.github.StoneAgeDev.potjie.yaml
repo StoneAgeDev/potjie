@@ -183,8 +183,10 @@ modules:
       - install -Dm644 icons/potjie-256.png
                        /app/share/icons/hicolor/256x256/apps/io.github.StoneAgeDev.potjie.png
     sources:
-      - type: dir
-        path: ..
+      - type: git
+        url: https://github.com/StoneAgeDev/potjie.git
+        tag: v0.1.0
+        commit: 02a68d384923eeb8ddf5d7ea4daad21735b0ee6b
       # Generated from Cargo.lock — regenerate when Cargo.lock changes:
       #   python3 flatpak-cargo-generator.py ../Cargo.lock -o cargo-sources.json
       - cargo-sources.json
