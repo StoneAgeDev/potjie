@@ -460,7 +460,7 @@ fn send_notification(body: &str) {
             .unwrap_or(0)
     );
     let vardict = format!(
-        "{{'title': <{}>, 'body': <{}>, 'icon': <('themed', <['com.potjie.Potjie']>)>}}",
+        "{{'title': <{}>, 'body': <{}>, 'icon': <('themed', <['io.github.StoneAgeDev.potjie']>)>}}",
         gvariant_str("Potjie"),
         gvariant_str(body),
     );
@@ -477,7 +477,7 @@ fn send_notification(body: &str) {
         "--dest", "org.freedesktop.Notifications",
         "--object-path", "/org/freedesktop/Notifications",
         "--method", "org.freedesktop.Notifications.Notify",
-        "Potjie", "0", "com.potjie.Potjie", "Potjie", body,
+        "Potjie", "0", "io.github.StoneAgeDev.potjie", "Potjie", body,
         "[]", "{}", "5000",
     ]);
 }
