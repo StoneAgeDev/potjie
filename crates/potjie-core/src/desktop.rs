@@ -11,7 +11,7 @@ use anyhow::{Context, Result};
 use std::path::PathBuf;
 
 /// Our Flatpak app id, used to re-enter the sandbox as a box's `ProxyCommand`.
-const APP_ID: &str = "com.potjie.Potjie";
+const APP_ID: &str = "io.github.StoneAgeDev.potjie";
 
 // ---- SSH alias for host apps --------------------------------------------
 

@@ -19,7 +19,7 @@ mod ui;
 use adw::prelude::*;
 use gtk::{gio, glib};
 
-const APP_ID: &str = "com.potjie.Potjie";
+const APP_ID: &str = "io.github.StoneAgeDev.potjie";
 
 fn main() -> glib::ExitCode {
     let args: Vec<String> = std::env::args().collect();
